@@ -1,5 +1,5 @@
 name: cortiq-hermes-router
-version: 0.2.0
+version: 0.2.1
 description: "AllaiGate model routing for Hermes — inexpensive models for simple tasks, stronger models for complex work. Classifies each turn (POST /v1/route), picks a model from your tiers/taskRules and rewrites the outgoing request via llm_request middleware. Config: ~/.config/cortiq-hermes-router/config.json, key: CORTIQ_ROUTER_KEY."
 author: "infosave2007 (Cortiq Team)"
 requires_env:
