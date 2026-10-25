@@ -6,7 +6,7 @@ cortiq-*-router family schema (taskRules -> globalTiers -> defaultModel) and
 rewrites ``request["model"]``. Classifier failures degrade to ``defaultModel``
 (and then to the current model) — the request never fails because of routing.
 
-Slash command: ``/cortiq-router status | decide <prompt> | on | off``.
+Slash command: ``/cortiq-router status | stats | decide <prompt> | on | off``.
 
 Capability ``llm.model_override`` is declared (consent screen at install) and
 re-checked live: without the grant the middleware stays pass-through.
@@ -21,10 +21,11 @@ import shlex
 import time
 from typing import Any, Optional
 
-from .cortiq_router.classify import classify
+from .cortiq_router.classify import classify, classify_detailed
 from .cortiq_router.config import ConfigError, default_config_path, load_config
 from .cortiq_router.routing import extract_last_user_text, truncate_text
 from .cortiq_router.select import select_model
+from .cortiq_router.stats import StatsAggregator, format_recent, format_stats
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,10 @@ CAPABILITY_RECHECK_SECONDS = 30.0
 _HELP = (
     "cortiq-hermes-router — AllaiGate model routing\n"
     "  /cortiq-router status            config, keys, last routing decision\n"
+    "  /cortiq-router stats [today|week|all]  persistent routing statistics\n"
+    "  /cortiq-router stats recent [N]   newest N decisions (default 10, max 200)\n"
+    "  /cortiq-router stats --json       full machine-readable aggregate\n"
+    "  /cortiq-router stats reset [yes]  clear statistics (requires yes)\n"
     "  /cortiq-router decide <prompt>   classify without routing (prints JSON)\n"
     "  /cortiq-router on | off          toggle routing for this profile\n"
     "  /cortiq-router help              this text"
@@ -57,6 +62,7 @@ def _summarize_tiers(config: dict) -> str:
 
 def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for isolated probing
     """Called once by the plugin loader (also by the validate capability probe)."""
+    statistics = StatsAggregator(getattr(ctx, "state", None))
     cache: dict[str, Any] = {
         "config_at": 0.0,
         "config": None,
@@ -101,24 +107,39 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
             return bool(config.get("enabled", True))
         return bool(override)
 
-    def _remember(selection: dict, original: str) -> None:
-        entry = {
-            "at": time.time(),
+    def _remember(selection: dict, original: str, *, status: str,
+                  classifier_latency_ms: Optional[float], at: float) -> None:
+        chosen = selection.get("model") or original or None
+        stored = statistics.record({
             "task": selection.get("task"),
             "score": selection.get("score"),
             "tier": selection.get("tier"),
-            "model": selection.get("model"),
-            "candidates": selection.get("candidates"),
-            "originalModel": original,
-            "fallback": selection.get("fallback"),
-        }
+            "model": chosen,
+            "originalModel": original or None,
+            "fallback": selection.get("fallback", False),
+            "status": status,
+            "classifier_latency_ms": classifier_latency_ms,
+        }, at=at)
+        entry = dict(stored)
+        entry["at"] = at
+        entry["candidates"] = selection.get("candidates")
         try:
             ctx.state.set("last_decision", entry)
         except Exception as exc:  # state must never break routing
             logger.debug("cortiq-router: cannot persist last_decision: %s", exc)
         cache["last"] = entry
 
-    def _classify_cached(text: str, config: dict) -> Optional[dict]:
+    def _remember_skipped(original: str, status: str, *, fallback: bool, at: float) -> None:
+        _remember({
+            "task": "unclassified",
+            "score": None,
+            "tier": None,
+            "model": original,
+            "candidates": [],
+            "fallback": fallback,
+        }, original, status=status, classifier_latency_ms=None, at=at)
+
+    def _classify_cached(text: str, config: dict) -> tuple[Optional[dict], dict]:
         key = hashlib.sha1(
             "|".join([
                 text,
@@ -130,19 +151,30 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
         now = time.monotonic()
         hit = cache["decisions"].get(key)
         if hit and now - hit[0] < DECISION_CACHE_TTL:
-            return hit[1]
-        decision = classify(text, config)
+            metadata = dict(hit[2])
+            metadata["classifier_latency_ms"] = None
+            return hit[1], metadata
+        decision, metadata = classify_detailed(text, config)
         if len(cache["decisions"]) >= DECISION_CACHE_MAX:
             cache["decisions"].clear()
-        cache["decisions"][key] = (now, decision)
-        return decision
+        cache["decisions"][key] = (now, decision, metadata)
+        return decision, metadata
 
     def _on_llm_request(request: Any, **context: Any) -> Optional[dict]:
         """llm_request middleware: may replace the outgoing provider kwargs."""
+        started_at = time.time()
+        original = ""
+        if isinstance(request, dict) and isinstance(request.get("model"), str):
+            original = request["model"]
         if not isinstance(request, dict):
+            _remember_skipped(original, "disabled", fallback=False, at=started_at)
             return None
         config = _config()
+        if cache["config_error"] is not None:
+            _remember_skipped(original, "invalid_config", fallback=True, at=started_at)
+            return None
         if not _routing_enabled(config):
+            _remember_skipped(original, "disabled", fallback=False, at=started_at)
             return None
         if not _capability_granted():
             if not cache["cap_warned"]:
@@ -152,18 +184,25 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
                     "Grant it with `hermes plugins enable cortiq-hermes-router` (consent) or "
                     "`hermes plugins capabilities cortiq-hermes-router`."
                 )
+            _remember_skipped(original, "disabled", fallback=False, at=started_at)
             return None
 
         text = truncate_text(extract_last_user_text(request.get("messages")),
                              int(config.get("maxChars", 12000)))
         if not text.strip():
+            _remember_skipped(original, "disabled", fallback=False, at=started_at)
             return None
 
-        decision = _classify_cached(text, config)
+        decision, metadata = _classify_cached(text, config)
         selection = select_model(config, decision)
         chosen = selection.get("model") or ""
         original = request.get("model") if isinstance(request.get("model"), str) else ""
-        _remember(selection, original)
+        _remember(
+            selection, original,
+            status=metadata.get("status", "ok" if decision else "classifier_error"),
+            classifier_latency_ms=metadata.get("classifier_latency_ms"),
+            at=started_at,
+        )
         if not chosen or chosen == original:
             if config.get("echoRouting"):
                 logger.warning(
@@ -218,7 +257,32 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
                          f"(was {last.get('originalModel') or '-'})")
         else:
             lines.append("  last decision  (none yet)")
+        lines.append("  statistics     /cortiq-router stats (today/week/all, recent, --json)")
         return "\n".join(lines)
+
+    def _stats_text(args: list[str]) -> str:
+        usage = ("usage: /cortiq-router stats [today|week|all] | recent [N] | "
+                 "--json | reset yes")
+        if not args:
+            return format_stats(statistics)
+        if args == ["--json"]:
+            return json.dumps(statistics.snapshot(), ensure_ascii=False, indent=2)
+        if len(args) == 1 and args[0] in ("today", "week", "all"):
+            return format_stats(statistics, args[0])
+        if args[0] == "recent" and len(args) <= 2:
+            try:
+                limit = 10 if len(args) == 1 else int(args[1])
+                return format_recent(statistics.recent(limit))
+            except (ValueError, TypeError):
+                return usage
+        if args[0] == "reset":
+            if args == ["reset", "yes"]:
+                statistics.reset()
+                return "cortiq-hermes-router: statistics reset; last_decision preserved."
+            if len(args) == 1:
+                return ("This permanently clears totals, daily history and recent decisions.\n"
+                        "To confirm: /cortiq-router stats reset yes")
+        return usage
 
     def _decide_text(prompt: str) -> str:
         config = _config()
@@ -246,6 +310,8 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
         sub = (argv[0].lower() if argv else "status")
         if sub in ("status",):
             return _status_text()
+        if sub == "stats":
+            return _stats_text([arg.lower() for arg in argv[1:]])
         if sub == "decide":
             prompt = " ".join(argv[1:]).strip()
             if not prompt:
@@ -260,5 +326,5 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
 
     ctx.register_middleware("llm_request", _on_llm_request)
     ctx.register_command("cortiq-router", handler=_handle,
-                         description="AllaiGate model routing: status, decide, on, off.",
-                         args_hint="[status|decide <prompt>|on|off]")
+                         description="AllaiGate routing: status, statistics, decide, on, off.",
+                         args_hint="[status|stats [today|week|all|recent [N]|--json|reset yes]|decide <prompt>|on|off]")

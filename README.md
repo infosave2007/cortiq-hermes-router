@@ -160,6 +160,12 @@ entries ignored. The classifier decides the tier — decisions are used 1:1.
 
 ```text
 /cortiq-router status            config, keys, last routing decision
+/cortiq-router stats             today/week/all table + all-time breakdowns
+/cortiq-router stats today|week|all
+/cortiq-router stats recent [N]  newest N decisions (default 10, max 200)
+/cortiq-router stats --json      full machine-readable aggregate
+/cortiq-router stats reset       safe confirmation prompt
+/cortiq-router stats reset yes   clear statistics, preserve last_decision
 /cortiq-router decide <prompt>   classify without routing (prints JSON)
 /cortiq-router on | off          toggle routing for this profile
 /cortiq-router help              usage
@@ -174,6 +180,113 @@ entries ignored. The classifier decides the tier — decisions are used 1:1.
   "candidates": ["anthropic/claude-haiku-5.5"],
   "fallback": false, "classifier": "ok",
   "source": "router", "requestId": "req_…", "profile": "balanced"
+}
+```
+
+## Statistics
+
+Every `llm_request` middleware invocation adds one **text-free decision record**:
+UTC timestamp, task, score, tier, selected and original models, fallback flag,
+status, and classifier latency when a classifier call was made. Cached decisions
+are counted too; their per-call classifier latency is `null`. Prompt and response
+text is never stored. State writes use Hermes's atomic plugin-state bridge;
+a state error leaves routing unaffected and the in-memory statistics intact.
+
+The aggregate contains all-time totals, per-UTC-day totals, and a 200-entry
+recent ring buffer. `week` means the current UTC day plus the previous six days.
+A v0.1 `last_decision` is migrated once without deleting it; `stats reset yes`
+clears only statistics and also preserves `last_decision`.
+
+Statuses are `ok`, `classifier_error` (HTTP, missing key, or invalid response),
+`classifier_timeout`, `invalid_config`, and `disabled` (routing off, capability
+not granted, or no classifiable request). These are plugin routing decisions,
+not upstream delivery receipts; Hermes's own log may still name the original
+model.
+
+```text
+/cortiq-router stats
+
+cortiq-hermes-router statistics (UTC; week = today + previous 6 days)
+
+Period  Calls  Fallback  Avg score  Avg cls ms  Max cls ms
+------  -----  --------  ---------  ----------  ----------
+today   3      1         0.4287     543.2       1500.0
+week    3      1         0.4287     543.2       1500.0
+all     3      1         0.4287     543.2       1500.0
+
+All time · By tier
+Name    Count
+------  -----
+(none)  1
+high    1
+low     1
+
+All time · By task
+Name          Count
+------------  -----
+code          1
+translation   1
+unclassified  1
+
+All time · By model
+Name                      Count
+------------------------  -----
+xiaomi/mimo-v2.6-flash    2
+moonshotai/kimi-k3.1-pro  1
+
+All time · By status
+Name                Count
+------------------  -----
+ok                  2
+classifier_timeout  1
+```
+
+`stats today`, `stats week`, or `stats all` selects one period for both the
+summary and all four breakdowns. Recent output is newest first:
+
+```text
+/cortiq-router stats recent 2
+
+cortiq-hermes-router recent decisions (newest first, UTC)
+Timestamp                 Status              Task          Score   Tier  Model                     Fallback  Cls ms  Original model
+------------------------  ------------------  ------------  ------  ----  ------------------------  --------  ------  ----------------------
+2026-10-25T12:00:02.000Z  classifier_timeout  unclassified  -       -     xiaomi/mimo-v2.6-flash    yes       1500.0  deepseek/deepseek-v3.2
+2026-10-25T12:00:01.000Z  ok                  code          0.6061  high  moonshotai/kimi-k3.1-pro  no        87.4    deepseek/deepseek-v3.2
+```
+
+`stats --json` emits the complete `version`, `timezone`, `totals`, `daily`, and
+`recent` object. Abridged `totals` example (the daily buckets use the same
+aggregate shape):
+
+```json
+{
+  "calls": 3,
+  "by_tier": {"low": 1, "high": 1, "(none)": 1},
+  "by_task": {"translation": 1, "code": 1, "unclassified": 1},
+  "by_model": {"xiaomi/mimo-v2.6-flash": 2, "moonshotai/kimi-k3.1-pro": 1},
+  "by_status": {"ok": 2, "classifier_timeout": 1},
+  "fallback_count": 1,
+  "avg_score": 0.4287,
+  "score_count": 2,
+  "avg_classifier_latency_ms": 543.167,
+  "classifier_latency_count": 3,
+  "max_classifier_latency_ms": 1500.0
+}
+```
+
+Each recent JSON entry has the following fields (shown in full):
+
+```json
+{
+  "timestamp": "2026-10-25T12:00:00.000Z",
+  "task": "translation",
+  "score": 0.2513,
+  "tier": "low",
+  "model": "xiaomi/mimo-v2.6-flash",
+  "originalModel": "deepseek/deepseek-v3.2",
+  "fallback": false,
+  "status": "ok",
+  "classifier_latency_ms": 42.1
 }
 ```
 
@@ -211,7 +324,7 @@ process, no `base_url` rewrite.
 ## Tests and validation
 
 ```sh
-python3 -m unittest discover -s tests -t .     # pure selection/config/classify logic
+python3 -m unittest discover -s tests -t .     # selection/config/classify/persistent stats logic
 cd standalone && npm run check                 # lint + build + 61 unit tests
 hermes plugins validate .                      # catalog gate: probe + security scan
 ```

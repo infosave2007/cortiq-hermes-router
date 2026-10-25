@@ -162,6 +162,12 @@ echo 'CORTIQ_ROUTER_KEY=ваш-ключ-allaigate' >> ~/.hermes/.env
 
 ```text
 /cortiq-router status            конфиг, ключи, последнее решение
+/cortiq-router stats             today/week/all + разбивки за всё время
+/cortiq-router stats today|week|all
+/cortiq-router stats recent [N]  последние N решений (10 по умолчанию, макс. 200)
+/cortiq-router stats --json      полный машиночитаемый агрегат
+/cortiq-router stats reset       безопасный запрос подтверждения
+/cortiq-router stats reset yes   очистить статистику, сохранить last_decision
 /cortiq-router decide <промпт>   классификация без маршрутизации (JSON)
 /cortiq-router on | off          вкл/выкл маршрутизацию профиля
 /cortiq-router help              справка
@@ -176,6 +182,114 @@ echo 'CORTIQ_ROUTER_KEY=ваш-ключ-allaigate' >> ~/.hermes/.env
   "candidates": ["anthropic/claude-haiku-5.5"],
   "fallback": false, "classifier": "ok",
   "source": "router", "requestId": "req_…", "profile": "balanced"
+}
+```
+
+## Статистика
+
+Каждый вызов middleware `llm_request` добавляет одну запись решения **без
+текста запроса**: UTC timestamp, task, score, tier, выбранную и исходную модели,
+fallback, status и classifier latency, если классификатор реально вызывался.
+Попадания в кеш тоже учитываются; их latency для этого вызова равна `null`.
+Тексты запросов и ответов не сохраняются. Запись идёт через атомарный
+plugin-state bridge Hermes; ошибка state не ломает маршрутизацию, а решение
+остаётся в агрегате в памяти.
+
+Агрегат содержит totals за всё время, такие же totals для каждого дня UTC и
+ring buffer recent на 200 решений. `week` — текущий день UTC плюс предыдущие
+шесть дней. Старый `last_decision` из v0.1 мигрирует один раз и не удаляется;
+`stats reset yes` очищает только статистику и тоже сохраняет `last_decision`.
+
+Статусы: `ok`, `classifier_error` (HTTP, нет ключа или невалидный ответ),
+`classifier_timeout`, `invalid_config` и `disabled` (маршрутизация выключена,
+capability не выдана или нет классифицируемого запроса). Это решения плагина,
+а не подтверждения ответа upstream: в собственном логе Hermes может остаться
+исходная модель.
+
+```text
+/cortiq-router stats
+
+cortiq-hermes-router statistics (UTC; week = today + previous 6 days)
+
+Period  Calls  Fallback  Avg score  Avg cls ms  Max cls ms
+------  -----  --------  ---------  ----------  ----------
+today   3      1         0.4287     543.2       1500.0
+week    3      1         0.4287     543.2       1500.0
+all     3      1         0.4287     543.2       1500.0
+
+All time · By tier
+Name    Count
+------  -----
+(none)  1
+high    1
+low     1
+
+All time · By task
+Name          Count
+------------  -----
+code          1
+translation   1
+unclassified  1
+
+All time · By model
+Name                      Count
+------------------------  -----
+xiaomi/mimo-v2.6-flash    2
+moonshotai/kimi-k3.1-pro  1
+
+All time · By status
+Name                Count
+------------------  -----
+ok                  2
+classifier_timeout  1
+```
+
+`stats today`, `stats week` или `stats all` выбирает период и для сводки, и для
+четырёх разбивок. `recent` показывает сначала новые решения:
+
+```text
+/cortiq-router stats recent 2
+
+cortiq-hermes-router recent decisions (newest first, UTC)
+Timestamp                 Status              Task          Score   Tier  Model                     Fallback  Cls ms  Original model
+------------------------  ------------------  ------------  ------  ----  ------------------------  --------  ------  ----------------------
+2026-10-25T12:00:02.000Z  classifier_timeout  unclassified  -       -     xiaomi/mimo-v2.6-flash    yes       1500.0  deepseek/deepseek-v3.2
+2026-10-25T12:00:01.000Z  ok                  code          0.6061  high  moonshotai/kimi-k3.1-pro  no        87.4    deepseek/deepseek-v3.2
+```
+
+`stats --json` выводит полный объект с ключами `version`, `timezone`, `totals`,
+`daily` и `recent`. Сокращённый пример `totals` (дневные bucket-ы имеют ту же
+форму агрегата):
+
+```json
+{
+  "calls": 3,
+  "by_tier": {"low": 1, "high": 1, "(none)": 1},
+  "by_task": {"translation": 1, "code": 1, "unclassified": 1},
+  "by_model": {"xiaomi/mimo-v2.6-flash": 2, "moonshotai/kimi-k3.1-pro": 1},
+  "by_status": {"ok": 2, "classifier_timeout": 1},
+  "fallback_count": 1,
+  "avg_score": 0.4287,
+  "score_count": 2,
+  "avg_classifier_latency_ms": 543.167,
+  "classifier_latency_count": 3,
+  "max_classifier_latency_ms": 1500.0
+}
+```
+
+Полный пример полей одной записи `recent`:
+
+```json
+{
+  "timestamp": "2026-10-25T12:00:00.000Z",
+  "task": "translation",
+  "score": 0.2513,
+  "tier": "low",
+  "model": "xiaomi/mimo-v2.6-flash",
+  "originalModel": "deepseek/deepseek-v3.2",
+  "fallback": false,
+  "status": "ok",
+  "classifier_latency_ms": 42.1
 }
 ```
 
@@ -213,7 +327,7 @@ node dist/server.js serve            # http://127.0.0.1:8791
 ## Тесты и проверки
 
 ```sh
-python3 -m unittest discover -s tests -t .     # чистая логика выбора/конфига/классификации
+python3 -m unittest discover -s tests -t .     # выбор/конфиг/классификация/персистентная статистика
 cd standalone && npm run check                 # lint + build + 61 юнит-тест
 hermes plugins validate .                      # каталог-гейт: probe + security scan
 ```

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import importlib
 import io
 import json
 import unittest
 import urllib.error
 
 from cortiq_router.classify import build_route_body, classify, parse_route_decision
+classify_module = importlib.import_module("cortiq_router.classify")
 
 # Shape fixture: matches a real AllaiGate /v1/route response (schema 1.1 subset).
 REAL_DECISION = {
@@ -145,8 +147,10 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(opener.last_timeout, 15.0)
 
     def test_http_error_degrades(self):
-        opener = _FakeOpener(error=urllib.error.HTTPError(
-            "https://router.allaigate.com/v1/route", 422, "Unprocessable", {}, None))
+        error = urllib.error.HTTPError(
+            "https://router.allaigate.com/v1/route", 422, "Unprocessable", {}, None)
+        opener = _FakeOpener(error=error)
+        self.addCleanup(error.close)
         logs = []
         result = classify("x", self.CONFIG, env={"CORTIQ_ROUTER_KEY": "k"},
                           log=logs.append, opener=opener)
@@ -180,6 +184,54 @@ class ClassifyTests(unittest.TestCase):
                           log=logs.append, opener=_Boom())
         self.assertIsNone(result)
         self.assertTrue(logs)
+
+
+class ClassifyMetadataTests(unittest.TestCase):
+    CONFIG = ClassifyTests.CONFIG
+
+    def test_success_has_ok_status_and_latency(self):
+        result, metadata = classify_module.classify_detailed(
+            "x", self.CONFIG, env={"CORTIQ_ROUTER_KEY": "k"},
+            log=lambda _msg: None, opener=_FakeOpener(payload=REAL_DECISION),
+        )
+        self.assertEqual(result["taskLabel"], "coding")
+        self.assertEqual(metadata["status"], "ok")
+        self.assertGreaterEqual(metadata["classifier_latency_ms"], 0)
+
+    def test_timeout_has_distinct_status(self):
+        opener = _FakeOpener(error=TimeoutError("timed out"))
+        result, metadata = classify_module.classify_detailed(
+            "x", self.CONFIG, env={"CORTIQ_ROUTER_KEY": "k"},
+            log=lambda _msg: None, opener=opener,
+        )
+        self.assertIsNone(result)
+        self.assertEqual(metadata["status"], "classifier_timeout")
+        self.assertGreaterEqual(metadata["classifier_latency_ms"], 0)
+
+    def test_url_error_timeout_reason_has_distinct_status(self):
+        opener = _FakeOpener(error=urllib.error.URLError(TimeoutError("timed out")))
+        _result, metadata = classify_module.classify_detailed(
+            "x", self.CONFIG, env={"CORTIQ_ROUTER_KEY": "k"},
+            log=lambda _msg: None, opener=opener,
+        )
+        self.assertEqual(metadata["status"], "classifier_timeout")
+
+    def test_http_error_and_missing_key_are_classifier_errors(self):
+        error = urllib.error.HTTPError(
+            "https://router.allaigate.com/v1/route", 500, "Server", {}, None)
+        opener = _FakeOpener(error=error)
+        self.addCleanup(error.close)
+        _result, metadata = classify_module.classify_detailed(
+            "x", self.CONFIG, env={"CORTIQ_ROUTER_KEY": "k"},
+            log=lambda _msg: None, opener=opener,
+        )
+        self.assertEqual(metadata["status"], "classifier_error")
+
+        _result, metadata = classify_module.classify_detailed(
+            "x", self.CONFIG, env={}, log=lambda _msg: None,
+        )
+        self.assertEqual(metadata["status"], "classifier_error")
+        self.assertIsNone(metadata["classifier_latency_ms"])
 
 
 if __name__ == "__main__":

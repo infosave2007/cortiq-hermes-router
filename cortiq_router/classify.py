@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Optional
@@ -91,16 +92,29 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect)
 
 
-def classify(text: str, config: dict, env: Optional[dict] = None,
-             log: Callable[[str], None] = logger.warning,
-             opener: Optional[urllib.request.OpenerDirector] = None) -> Optional[dict]:
-    """Classify text; returns a validated decision or ``None`` — never raises."""
+def _is_timeout(exc: BaseException) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    reason = getattr(exc, "reason", None)
+    return isinstance(reason, BaseException) and _is_timeout(reason)
+
+
+def _metadata(status: str, started: float, *, attempted: bool = True) -> dict[str, Any]:
+    latency = round(max(0.0, time.monotonic() - started) * 1000.0, 3) if attempted else None
+    return {"status": status, "classifier_latency_ms": latency}
+
+
+def classify_detailed(text: str, config: dict, env: Optional[dict] = None,
+                      log: Callable[[str], None] = logger.warning,
+                      opener: Optional[urllib.request.OpenerDirector] = None) -> tuple[Optional[dict], dict[str, Any]]:
+    """Classify and return ``(decision, {status, classifier_latency_ms})``."""
+    started = time.monotonic()
     env = os.environ if env is None else env
     key = env.get(config.get("apiKeyEnv", "CORTIQ_ROUTER_KEY"))
     if not key:
         log(f"cortiq-hermes-router: {config.get('apiKeyEnv', 'CORTIQ_ROUTER_KEY')} is not set — "
             "classification skipped, using fallback chain")
-        return None
+        return None, _metadata("classifier_error", started, attempted=False)
 
     base = str(config.get("routerUrl", "https://router.allaigate.com")).rstrip("/")
     payload = json.dumps(build_route_body(
@@ -125,21 +139,33 @@ def classify(text: str, config: dict, env: Optional[dict] = None,
             status = getattr(response, "status", 200)
             if status != 200:
                 log(f"cortiq-hermes-router: classifier HTTP {status} — using fallback chain")
-                return None
+                return None, _metadata("classifier_error", started)
             raw = response.read()
     except urllib.error.HTTPError as exc:
         log(f"cortiq-hermes-router: classifier HTTP {exc.code} — using fallback chain")
-        return None
+        return None, _metadata("classifier_error", started)
     except Exception as exc:  # timeout / DNS / connection reset — degrade, never raise
         log(f"cortiq-hermes-router: classifier unreachable ({exc}) — using fallback chain")
-        return None
+        status = "classifier_timeout" if _is_timeout(exc) else "classifier_error"
+        return None, _metadata(status, started)
 
     try:
         parsed = json.loads(raw)
     except ValueError:
         log("cortiq-hermes-router: invalid classifier response — using fallback chain")
-        return None
+        return None, _metadata("classifier_error", started)
     decision = parse_route_decision(parsed)
     if decision is None:
         log("cortiq-hermes-router: invalid classifier response — using fallback chain")
+        return None, _metadata("classifier_error", started)
+    return decision, _metadata("ok", started)
+
+
+def classify(text: str, config: dict, env: Optional[dict] = None,
+             log: Callable[[str], None] = logger.warning,
+             opener: Optional[urllib.request.OpenerDirector] = None) -> Optional[dict]:
+    """Classify text; returns a validated decision or ``None`` — never raises."""
+    decision, _metadata_value = classify_detailed(
+        text, config, env=env, log=log, opener=opener,
+    )
     return decision
