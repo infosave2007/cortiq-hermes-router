@@ -41,6 +41,7 @@ _HELP = (
     "  /cortiq-router stats recent [N]   newest N decisions (default 10, max 200)\n"
     "  /cortiq-router stats --json       full machine-readable aggregate\n"
     "  /cortiq-router stats reset [yes]  clear statistics (requires yes)\n"
+    "  /cortiq-router clean [yes]       same as stats reset: wipe statistics (requires yes)\n"
     "  /cortiq-router decide <prompt>   classify without routing (prints JSON)\n"
     "  /cortiq-router on | off          toggle routing for this profile\n"
     "  /cortiq-router help              this text"
@@ -317,6 +318,12 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
             if not prompt:
                 return 'usage: /cortiq-router decide "<prompt>"'
             return _decide_text(prompt)
+        if sub == "clean":
+            if argv[1:] == ["yes"]:
+                statistics.reset()
+                return "cortiq-hermes-router: statistics cleaned; last_decision preserved."
+            return ("This permanently clears totals, daily history and recent decisions.\n"
+                    "To confirm: /cortiq-router clean yes")
         if sub in ("on", "off"):
             ctx.set_config("enabled", sub == "on")
             return f"cortiq-hermes-router: routing {'ON' if sub == 'on' else 'OFF'} for this profile."
@@ -326,5 +333,5 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
 
     ctx.register_middleware("llm_request", _on_llm_request)
     ctx.register_command("cortiq-router", handler=_handle,
-                         description="AllaiGate routing: status, statistics, decide, on, off.",
-                         args_hint="[status|stats [today|week|all|recent [N]|--json|reset yes]|decide <prompt>|on|off]")
+                         description="AllaiGate routing: status, statistics, clean, decide, on, off.",
+                         args_hint="[status|stats [today|week|all|recent [N]|--json|reset yes]|clean yes|decide <prompt>|on|off]")
