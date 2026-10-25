@@ -94,10 +94,12 @@ hermes plugins enable cortiq-hermes-router
 ### Into the official catalog
 
 The curated catalog lives in [`NousResearch/hermes-agent`
-`plugin-catalog/`](https://github.com/NousResearch/hermes-agent) — to publish
-there: open a PR adding `plugin-catalog/cortiq-hermes-router.yaml` (name,
-description, `update_url` pointing at this repository and the 40-character
-commit SHA pin), pass `hermes plugins validate <path>` and the catalog CI.
+`plugin-catalog/`](https://github.com/NousResearch/hermes-agent). The entry
+`plugin-catalog/cortiq-hermes-router.yaml` (fields: `name`, `repo`, `sha` —
+a 40-character commit pin — `description`, `maintainer`, `tier`, `category`,
+`docs_url`, `version`, `capabilities`) is submitted and awaiting review in
+[PR #144419](https://github.com/NousResearch/hermes-agent/pull/144419).
+After it merges, install by name: `hermes plugins install cortiq-hermes-router`.
 Until then the two install paths above work today.
 
 If the gateway is already running, restart it **from an external shell**:
@@ -106,8 +108,9 @@ chat session — do not run them from chat.
 
 ## Configure
 
-Put your AllaiGate key in the environment that starts Hermes (never in this
-repository):
+Get a free AllaiGate API key at [api.allaigate.com](https://api.allaigate.com/)
+(the router's classifier key, separate from any model-provider keys). Put it
+in the environment that starts Hermes (never in this repository):
 
 ```sh
 echo 'CORTIQ_ROUTER_KEY=your-allaigate-key' >> ~/.hermes/.env

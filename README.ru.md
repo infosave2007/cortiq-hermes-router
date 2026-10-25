@@ -95,12 +95,13 @@ hermes plugins enable cortiq-hermes-router
 ### В официальный каталог
 
 Курируемый каталог лежит в
-[`NousResearch/hermes-agent` `plugin-catalog/`](https://github.com/NousResearch/hermes-agent) —
-чтобы попасть туда: откройте PR, добавив
-`plugin-catalog/cortiq-hermes-router.yaml` (name, description, `update_url` на
-этот репозиторий и пин 40-символьный SHA коммита), и пройдите
-`hermes plugins validate <path>` и CI каталога. До этого оба способа установки
-выше работают уже сегодня.
+[`NousResearch/hermes-agent` `plugin-catalog/`](https://github.com/NousResearch/hermes-agent).
+Запись `plugin-catalog/cortiq-hermes-router.yaml` (поля: `name`, `repo`, `sha`
+— пин 40-символьного коммита — `description`, `maintainer`, `tier`,
+`category`, `docs_url`, `version`, `capabilities`) подана и ждёт ревью в
+[PR #144419](https://github.com/NousResearch/hermes-agent/pull/144419).
+После мержа установка по имени: `hermes plugins install cortiq-hermes-router`.
+До этого оба способа установки выше работают уже сегодня.
 
 Если gateway уже запущен, перезапустите его **из внешнего шелла**:
 `hermes gateway restart`. Команды жизненного цикла gateway заблокированы
@@ -108,8 +109,10 @@ hermes plugins enable cortiq-hermes-router
 
 ## Настройка
 
-Положите ключ AllaiGate в окружение, из которого стартует Hermes (никогда в
-репозиторий):
+Бесплатный API-ключ AllaiGate получается на
+[api.allaigate.com](https://api.allaigate.com/ru/) — это ключ классификатора
+роутера, отдельный от ключей модельного провайдера. Положите его в окружение,
+из которого стартует Hermes (никогда в репозиторий):
 
 ```sh
 echo 'CORTIQ_ROUTER_KEY=ваш-ключ-allaigate' >> ~/.hermes/.env
