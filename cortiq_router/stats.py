@@ -21,6 +21,11 @@ SCHEMA_VERSION = 1
 RECENT_LIMIT = 200
 
 
+#: Aggregate keys added in schema 1.1 (v0.3.0). Older state lacks them and is
+#: upgraded in place by :func:`_upgrade_aggregate`; no field is renamed or removed.
+_COUNTER_KEYS = ("by_provider", "fallback_reasons", "fallback_by_provider")
+
+
 def empty_aggregate() -> dict[str, Any]:
     return {
         "calls": 0,
@@ -28,6 +33,11 @@ def empty_aggregate() -> dict[str, Any]:
         "by_task": {},
         "by_model": {},
         "by_status": {},
+        "by_provider": {},
+        "fallback_reasons": {},
+        "fallback_by_provider": {},
+        "execution_fallback_count": 0,
+        "step_continuation_count": 0,
         "fallback_count": 0,
         "avg_score": None,
         "score_count": 0,
@@ -45,6 +55,15 @@ def _empty_state() -> dict[str, Any]:
         "daily": {},
         "recent": [],
     }
+
+
+def _upgrade_aggregate(aggregate: Any) -> dict[str, Any]:
+    """Fill keys missing from an aggregate written by an older release."""
+    if not isinstance(aggregate, dict):
+        return empty_aggregate()
+    for key, value in empty_aggregate().items():
+        aggregate.setdefault(key, value)
+    return aggregate
 
 
 def _number(value: Any) -> Optional[float]:
@@ -81,6 +100,12 @@ class StatsAggregator:
                 logger.debug("cortiq-router: cannot load statistics: %s", exc)
             if not isinstance(self._data.get("totals"), dict):
                 self._data = _empty_state()
+            self._data["totals"] = _upgrade_aggregate(self._data["totals"])
+            if isinstance(self._data.get("daily"), dict):
+                for day, aggregate in self._data["daily"].items():
+                    self._data["daily"][day] = _upgrade_aggregate(aggregate)
+            else:
+                self._data["daily"] = {}
             if stored is None:
                 self._migrate_last_decision()
 
@@ -127,6 +152,10 @@ class StatsAggregator:
         cls._increment(aggregate["by_task"], entry["task"] or "(none)")
         cls._increment(aggregate["by_model"], entry["model"] or "(none)")
         cls._increment(aggregate["by_status"], entry["status"])
+        if entry.get("step_continuation"):
+            aggregate["step_continuation_count"] += 1
+        if entry.get("provider"):
+            cls._increment(aggregate["by_provider"], entry["provider"])
         if entry["fallback"]:
             aggregate["fallback_count"] += 1
 
@@ -163,6 +192,8 @@ class StatsAggregator:
             "fallback": bool(decision.get("fallback", False)),
             "status": str(decision.get("status") or "ok"),
             "classifier_latency_ms": _number(decision.get("classifier_latency_ms")),
+            "provider": decision.get("provider") or None,
+            "step_continuation": bool(decision.get("step_continuation", False)),
         }
         day = entry["timestamp"][:10]
         with self._lock:
@@ -175,15 +206,37 @@ class StatsAggregator:
             self._persist()
             return copy.deepcopy(entry)
 
+    def record_execution_fallback(self, provider: Optional[str], reason: str, *,
+                                  at: Optional[float] = None) -> None:
+        """Count one failed direct call that fell open to the Hermes model.
+
+        ``reason`` is a short machine code (``timeout``, ``http_500``, ...); no
+        request or response content is accepted here.
+        """
+        stamp = time.time() if at is None else float(at)
+        code = str(reason or "unknown")[:64]
+        name = str(provider or "unknown")[:64]
+        day = utc_timestamp(stamp)[:10]
+        with self._lock:
+            for aggregate in (self._data["totals"],
+                              self._data["daily"].setdefault(day, empty_aggregate())):
+                aggregate["execution_fallback_count"] += 1
+                self._increment(aggregate["fallback_reasons"], code)
+                self._increment(aggregate["fallback_by_provider"], name)
+            self._persist()
+
     @staticmethod
     def _combine(aggregates: list[dict[str, Any]]) -> dict[str, Any]:
         combined = empty_aggregate()
         score_sum = 0.0
         latency_sum = 0.0
         for aggregate in aggregates:
+            aggregate = _upgrade_aggregate(aggregate)
             combined["calls"] += aggregate["calls"]
             combined["fallback_count"] += aggregate["fallback_count"]
-            for name in ("by_tier", "by_task", "by_model", "by_status"):
+            combined["execution_fallback_count"] += aggregate["execution_fallback_count"]
+            combined["step_continuation_count"] += aggregate["step_continuation_count"]
+            for name in ("by_tier", "by_task", "by_model", "by_status", *_COUNTER_KEYS):
                 for key, count in aggregate[name].items():
                     combined[name][key] = combined[name].get(key, 0) + count
             score_count = aggregate["score_count"]
@@ -311,8 +364,13 @@ def format_stats(
         ("by_task", "By task"),
         ("by_model", "By model"),
         ("by_status", "By status"),
+        ("by_provider", "By provider"),
+        ("fallback_reasons", "Execution fallbacks by reason"),
+        ("fallback_by_provider", "Execution fallbacks by provider"),
     ):
-        lines.append(_breakdown(f"{labels[selected]} · {title}", aggregate[key]))
+        values = _upgrade_aggregate(aggregate).get(key) or {}
+        if values:
+            lines.append(_breakdown(f"{labels[selected]} · {title}", values))
     return "\n\n".join(lines)
 
 
@@ -330,8 +388,10 @@ def format_recent(entries: list[dict[str, Any]]) -> str:
         "yes" if entry["fallback"] else "no",
         _latency(entry["classifier_latency_ms"]),
         entry["originalModel"],
+        entry.get("provider") or "-",
+        "yes" if entry.get("step_continuation") else "no",
     ] for entry in entries]
     return "cortiq-hermes-router recent decisions (newest first, UTC)\n" + _table(
-        ["Timestamp", "Status", "Task", "Score", "Tier", "Model", "Fallback", "Cls ms", "Original model"],
+        ["Timestamp", "Status", "Task", "Score", "Tier", "Model", "Fallback", "Cls ms", "Original model", "Provider", "Tool step"],
         rows,
     )

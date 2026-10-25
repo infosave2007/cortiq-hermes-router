@@ -13,6 +13,9 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
+
+from .providers import API_MODES, ENTRY_FIELDS, is_provider_entry, normalize_entry
 
 PROFILES: tuple[str, ...] = ("balanced", "cost-saver", "quality-first")
 TIERS: tuple[str, ...] = ("low", "medium", "high")
@@ -22,6 +25,9 @@ FIELDS = frozenset({
     "routerProfile", "complexityBands", "globalTiers", "taskRules",
     "defaultModel", "echoRouting",
 })
+
+RESERVED_EXTRA_BODY_KEYS: tuple[str, ...] = ("model", "messages", "stream")
+LOOPBACK_HOSTS: tuple[str, ...] = ("localhost", "127.0.0.1", "::1")
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _MODEL_ID = re.compile(r"^[^/\s]+/\S+$")
@@ -61,14 +67,71 @@ def _ensure_model(value: Any, path_: str) -> str:
     return value
 
 
+def _ensure_provider_entry(value: Any, path_: str) -> None:
+    if not _is_object(value) or any(key not in ENTRY_FIELDS for key in value):
+        _invalid(path_)
+    provider = value.get("provider")
+    model = value.get("model")
+    if not isinstance(provider, str) or not re.match(r"^[A-Za-z0-9_.-]+$", provider):
+        _invalid(f"{path_}.provider")
+    if not isinstance(model, str) or not model.strip() or any(ch.isspace() for ch in model):
+        _invalid(f"{path_}.model")
+    if value.get("baseUrl") is not None:
+        base_url = value["baseUrl"]
+        if not isinstance(base_url, str):
+            _invalid(f"{path_}.baseUrl")
+        try:
+            parsed = urlparse(base_url)
+        except ValueError:
+            _invalid(f"{path_}.baseUrl")
+            raise
+        if (parsed.scheme not in ("http", "https") or not parsed.netloc
+                or parsed.username or parsed.password or parsed.query or parsed.fragment):
+            _invalid(f"{path_}.baseUrl")
+    if value.get("apiKeyEnv") is not None and (
+        not isinstance(value["apiKeyEnv"], str) or not _ENV_NAME.match(value["apiKeyEnv"])
+    ):
+        _invalid(f"{path_}.apiKeyEnv")
+    if value.get("apiMode", "chat_completions") not in API_MODES:
+        _invalid(f"{path_}.apiMode")
+    timeout = value.get("timeoutMs")
+    if timeout is not None and (
+        not isinstance(timeout, int) or isinstance(timeout, bool) or not 1 <= timeout <= 120000
+    ):
+        _invalid(f"{path_}.timeoutMs")
+    if value.get("extraBody") is not None and not _is_object(value["extraBody"]):
+        _invalid(f"{path_}.extraBody")
+    try:
+        normalized = normalize_entry(value)
+    except (KeyError, TypeError, ValueError):
+        _invalid(path_)
+        raise
+    if not normalized.get("baseUrl"):
+        _invalid(f"{path_}.baseUrl (required for this provider)")
+    if any(key in (value.get("extraBody") or {}) for key in RESERVED_EXTRA_BODY_KEYS):
+        _invalid(f"{path_}.extraBody (model, messages and stream are set by the router)")
+    # A key must never travel in cleartext: plain http only to loopback, or to an
+    # endpoint that needs no credential (e.g. an unauthenticated LAN server).
+    parsed_base = urlparse(normalized["baseUrl"])
+    if (parsed_base.scheme == "http" and parsed_base.hostname not in LOOPBACK_HOSTS
+            and normalized.get("apiKeyEnv")):
+        _invalid(f"{path_}.baseUrl (plain http with apiKeyEnv requires a loopback host)")
+
+
 def _ensure_models(value: Any, path_: str, single: bool = False) -> None:
-    if single and isinstance(value, str):
-        _ensure_model(value, path_)
+    if single and (isinstance(value, str) or is_provider_entry(value)):
+        if isinstance(value, str):
+            _ensure_model(value, path_)
+        else:
+            _ensure_provider_entry(value, path_)
         return
     if not isinstance(value, list):
         _invalid(path_)
     for item in value:
-        _ensure_model(item, path_)
+        if isinstance(item, str):
+            _ensure_model(item, path_)
+        else:
+            _ensure_provider_entry(item, path_)
 
 
 def _ensure_router_url(value: Any, field: str) -> str:
@@ -137,7 +200,7 @@ def parse_config(raw: Any) -> dict:
         if not _is_object(raw["taskRules"]):
             _invalid("taskRules")
         for value in raw["taskRules"].values():
-            if _is_object(value):
+            if _is_object(value) and not is_provider_entry(value):
                 for key, models in value.items():
                     if key not in (*TIERS, "any", "models"):
                         _invalid("taskRules")
@@ -147,7 +210,7 @@ def parse_config(raw: Any) -> dict:
 
     default_model = raw.get("defaultModel")
     if default_model not in (None, ""):
-        _ensure_model(default_model, "defaultModel")
+        _ensure_models(default_model, "defaultModel", single=True)
 
     config = dict(DEFAULTS)
     config.update({k: v for k, v in raw.items()})

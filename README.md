@@ -145,7 +145,7 @@ Model ids must be valid **for your provider** (for OpenRouter:
 | `maxChars` | `12000`; integer 1–1000000 UTF-16 code units |
 | `routerProfile` | `balanced`, `cost-saver`, or `quality-first` |
 | `complexityBands` | Omitted (default): use the router tier. Optional `{ "low": 0.35, "medium": 0.65 }` overrides score thresholds |
-| `globalTiers` | Empty; arrays for `low`, `medium`, `high` |
+| `globalTiers` | Empty; arrays for `low`, `medium`, `high` of model strings or endpoint objects (see [Providers](#providers-and-local-models)) |
 | `taskRules` | Empty; task label → model string/array or tier object with `low`, `medium`, `high`, `any` (`models` is an alias for `any`) |
 | `defaultModel` | Unset; last candidate and classifier-error fallback |
 | `echoRouting` | `false`; log each routing decision (`task=…;score=…;model=…`) |
@@ -155,6 +155,120 @@ first; at `high` the global `high` chain precedes the task's `any` models
 (escalation is never undercut), at `low`/`medium` the task's `any` models go
 first; `defaultModel` is the last candidate. Duplicates are dropped, empty
 entries ignored. The classifier decides the tier — decisions are used 1:1.
+
+## Providers and local models
+
+A tier entry is either a **string** — an OpenRouter model id sent through Hermes'
+own client, exactly as in 0.2.x — or an **object** that names its own endpoint:
+
+```json
+{
+  "globalTiers": {
+    "low": [
+      { "provider": "ollama", "model": "qwen3:8b" },
+      "xiaomi/mimo-v2.6-flash"
+    ],
+    "medium": [
+      { "provider": "lmstudio", "model": "qwen2.5-coder-14b-instruct" },
+      "anthropic/claude-haiku-5.5"
+    ],
+    "high": [
+      { "provider": "cortiq", "model": "qwen38-27b-q4tp", "baseUrl": "http://127.0.0.1:8080/v1" },
+      { "provider": "openai", "model": "gpt-4.1", "apiKeyEnv": "OPENAI_API_KEY" }
+    ]
+  },
+  "taskRules": {
+    "coding": {
+      "low": [{ "provider": "vllm", "model": "Qwen/Qwen2.5-Coder-7B", "baseUrl": "http://127.0.0.1:9000/v1" }],
+      "any": ["anthropic/claude-haiku-5.5"]
+    }
+  },
+  "defaultModel": "xiaomi/mimo-v2.6-flash"
+}
+```
+
+For `cortiq`, use the id that the server lists at `GET /v1/models`. The
+`cortiq` preset is `http://127.0.0.1:8080/v1` (the `cortiq serve` default port).
+
+| Field | Meaning |
+| --- | --- |
+| `provider` | required; a preset name or any label for an explicit `baseUrl` |
+| `model` | required; the id the endpoint expects (no `provider/` prefix needed for local servers) |
+| `baseUrl` | `http(s)://…/v1`; defaults from the preset; **required** for `vllm`, `llamacpp` and unknown providers |
+| `apiKeyEnv` | **name** of an environment variable holding the key — never the key itself |
+| `apiMode` | `chat_completions` (default) or `anthropic_messages` |
+| `timeoutMs` | default `60000`; maximum silence allowed between bytes, 1–120000 |
+| `extraBody` | object merged into the request body; cannot set `model`, `messages` or `stream` |
+
+Presets (`provider` → `baseUrl`, key variable):
+
+| Provider | Base URL | Key variable |
+| --- | --- | --- |
+| `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
+| `ollama` | `http://127.0.0.1:11434/v1` | — |
+| `lmstudio` | `http://127.0.0.1:1234/v1` | — |
+| `cortiq` | `http://127.0.0.1:8080/v1` | — |
+| `openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+| `deepseek` | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` |
+| `groq` | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` |
+| `together` | `https://api.together.xyz/v1` | `TOGETHER_API_KEY` |
+| `anthropic` | `https://api.anthropic.com` (set `apiMode: anthropic_messages`) | `ANTHROPIC_API_KEY` |
+| `vllm`, `llamacpp` | none — give `baseUrl` | optional |
+
+**Validation** is strict, like the rest of the config: unknown fields, a
+`baseUrl` without `http(s)://`, credentials in a URL, a `model` containing
+spaces, and a plain-`http` endpoint with `apiKeyEnv` on a non-loopback host are
+configuration errors (routing pauses and the previous model is kept). A missing
+key variable is a **warning** and the call falls back at request time. Duplicate
+entries are warned about. Keys are never written to config, logs, statistics or
+command output.
+
+**How direct calls run (`llm_execution`).** Object entries are executed by the
+plugin against their own endpoint, with tool calls supported on both API modes.
+Fail-open is unconditional: any failure re-runs the request through the model
+Hermes was going to use, and the reason is counted in statistics:
+`timeout`, `connection`, `http_<status>`, `invalid_json`, `invalid_stream`,
+`stream_error`, `invalid_response`, `empty_response`, `missing_key`,
+`unsupported_request`, `provider_override_not_granted`, `internal_error`.
+
+- Hermes asks for streaming by default. Direct calls also stream upstream, but the
+  reply is assembled before Hermes receives it, so routed direct calls do not show
+  live token-by-token output.
+- `anthropic_messages` calls are non-streaming upstream; image content is not converted.
+- Hermes' OpenRouter-only request options (`extra_body`, provider preferences) are not
+  forwarded to direct endpoints; use `extraBody` for what an endpoint needs.
+- Direct endpoints need the **`llm.provider_override`** capability. It is declared
+  at install (consent screen). An install upgraded from 0.2.x must be granted it:
+  `hermes plugins capabilities cortiq-hermes-router`. Until then direct entries are
+  skipped with a one-time warning, and the model is **not** rewritten to a local id.
+- The standalone proxy in `standalone/` accepts string entries only.
+
+**Checking endpoints without spending tokens**
+
+```text
+/cortiq-router providers         GET {baseUrl}/models, 3 s timeout, no completion;
+                                 key shown only as "set" or "MISSING"
+/cortiq-router test <tier|provider>   one prompt, max_tokens=8; runs only when you type it
+```
+
+## Cost control
+
+A user turn can make dozens of provider calls (tool loops). The router classifies
+the turn once and does not re-classify each tool step:
+
+| Call within a turn (`api_call_count`) | Model choice |
+| --- | --- |
+| `1` (first call) | classify, then tier and `taskRules` as usual |
+| `2` and later (tool-loop continuation) | **no classifier call**; the first `globalTiers.low` entry, or `defaultModel` if `low` is empty; `taskRules` are not consulted |
+| new turn (new `turn_id`) | classify again |
+
+Retries inside the same turn reuse that turn's decision from the cache. When
+`api_call_count` is absent, the call is treated as a first call.
+
+Choose the `low` entry with care: it serves every tool step of long turns. Pick
+the cheapest model that still produces reliable tool calls. Statistics report
+tool steps as `step_continuation_count` (totals and per day), a `Tool step`
+column in `stats recent`, and status `step_continuation`.
 
 ## Slash command
 
@@ -166,6 +280,8 @@ entries ignored. The classifier decides the tier — decisions are used 1:1.
 /cortiq-router stats --json      full machine-readable aggregate
 /cortiq-router stats reset       safe confirmation prompt
 /cortiq-router stats reset yes   clear statistics, preserve last_decision
+/cortiq-router providers               configured endpoints: GET {baseUrl}/models, no completion, keys hidden
+/cortiq-router test <tier|provider>   one cheap prompt through that endpoint (explicit only)
 /cortiq-router decide <prompt>   classify without routing (prints JSON)
 /cortiq-router on | off          toggle routing for this profile
 /cortiq-router help              usage
@@ -290,6 +406,12 @@ Each recent JSON entry has the following fields (shown in full):
 }
 ```
 
+Tool-loop steps and direct endpoints are visible in the aggregate: `by_provider`
+counts routed decisions per endpoint (`openrouter` for string entries), and
+`execution_fallback_count`, `fallback_reasons` and `fallback_by_provider` count
+direct calls that failed open. `step_continuation_count` counts tool steps that
+skipped classification. Stored statistics from 0.2.x are upgraded in place.
+
 ## Standalone OpenAI-compatible proxy (optional)
 
 For harnesses that are not Hermes — Codex, Cline, OpenCode, scripts — the same
@@ -324,9 +446,10 @@ process, no `base_url` rewrite.
 ## Tests and validation
 
 ```sh
-python3 -m unittest discover -s tests -t .     # selection/config/classify/persistent stats logic
+python3 -m unittest discover -s tests -t .     # 136 tests: selection, config, providers, HTTP execution, cost control, stats, slash
 cd standalone && npm run check                 # lint + build + 61 unit tests
 hermes plugins validate .                      # catalog gate: probe + security scan
+hermes plugins doctor .                        # real runtime contracts (import + registration)
 ```
 
 Full real-world evidence — three tiers, concurrent streams, empty/oversized/

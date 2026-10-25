@@ -147,7 +147,7 @@ echo 'CORTIQ_ROUTER_KEY=ваш-ключ-allaigate' >> ~/.hermes/.env
 | `maxChars` | `12000`; целое 1–1000000 кодовых единиц UTF-16 |
 | `routerProfile` | `balanced`, `cost-saver` или `quality-first` |
 | `complexityBands` | Опущено (по умолчанию): используется tier роутера. Опционально `{ "low": 0.35, "medium": 0.65 }` задаёт свои границы баллов |
-| `globalTiers` | Пусто; массивы для `low`, `medium`, `high` |
+| `globalTiers` | Пусто; массивы для `low`, `medium`, `high` из строк-моделей или объектов endpoint'ов (см. [Провайдеры](#провайдеры-и-локальные-модели)) |
 | `taskRules` | Пусто; метка задачи → модель/массив либо объект с `low`, `medium`, `high`, `any` (`models` — синоним `any`) |
 | `defaultModel` | Не задана; последний кандидат и резерв при ошибке классификатора |
 | `echoRouting` | `false`; логировать каждое решение (`task=…;score=…;model=…`) |
@@ -157,6 +157,122 @@ echo 'CORTIQ_ROUTER_KEY=ваш-ключ-allaigate' >> ~/.hermes/.env
 (эскаляция никогда не занижается), на `low`/`medium` `any` задачи идёт первым;
 `defaultModel` — последний кандидат. Дубликаты отбрасываются, пустые записи
 игнорируются. Тир назначает классификатор — решения берутся как есть.
+
+## Провайдеры и локальные модели
+
+Запись тира — это либо **строка** (id модели OpenRouter, идёт через собственный
+клиент Hermes, как и в 0.2.x), либо **объект**, который задаёт свой endpoint:
+
+```json
+{
+  "globalTiers": {
+    "low": [
+      { "provider": "ollama", "model": "qwen3:8b" },
+      "xiaomi/mimo-v2.6-flash"
+    ],
+    "medium": [
+      { "provider": "lmstudio", "model": "qwen2.5-coder-14b-instruct" },
+      "anthropic/claude-haiku-5.5"
+    ],
+    "high": [
+      { "provider": "cortiq", "model": "qwen38-27b-q4tp", "baseUrl": "http://127.0.0.1:8080/v1" },
+      { "provider": "openai", "model": "gpt-4.1", "apiKeyEnv": "OPENAI_API_KEY" }
+    ]
+  },
+  "taskRules": {
+    "coding": {
+      "low": [{ "provider": "vllm", "model": "Qwen/Qwen2.5-Coder-7B", "baseUrl": "http://127.0.0.1:9000/v1" }],
+      "any": ["anthropic/claude-haiku-5.5"]
+    }
+  },
+  "defaultModel": "xiaomi/mimo-v2.6-flash"
+}
+```
+
+Для `cortiq` используйте id, который сервер возвращает в `GET /v1/models`.
+Пресет `cortiq` — `http://127.0.0.1:8080/v1` (порт по умолчанию у `cortiq serve`).
+
+| Поле | Значение |
+| --- | --- |
+| `provider` | обязательно; имя пресета или любая метка для явного `baseUrl` |
+| `model` | обязательно; id, который ждёт endpoint (префикс `provider/` для локальных серверов не нужен) |
+| `baseUrl` | `http(s)://…/v1`; берётся из пресета; **обязателен** для `vllm`, `llamacpp` и неизвестных провайдеров |
+| `apiKeyEnv` | **имя** переменной окружения с ключом — не сам ключ |
+| `apiMode` | `chat_completions` (по умолчанию) или `anthropic_messages` |
+| `timeoutMs` | по умолчанию `60000`; максимальная пауза между байтами, 1–120000 |
+| `extraBody` | объект, добавляемый в тело запроса; не может задавать `model`, `messages`, `stream` |
+
+Пресеты (`provider` → `baseUrl`, переменная ключа):
+
+| Провайдер | Base URL | Переменная ключа |
+| --- | --- | --- |
+| `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
+| `ollama` | `http://127.0.0.1:11434/v1` | — |
+| `lmstudio` | `http://127.0.0.1:1234/v1` | — |
+| `cortiq` | `http://127.0.0.1:8080/v1` | — |
+| `openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+| `deepseek` | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` |
+| `groq` | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` |
+| `together` | `https://api.together.xyz/v1` | `TOGETHER_API_KEY` |
+| `anthropic` | `https://api.anthropic.com` (задать `apiMode: anthropic_messages`) | `ANTHROPIC_API_KEY` |
+| `vllm`, `llamacpp` | нет — укажите `baseUrl` | необязательно |
+
+**Валидация** строгая, как и остальной конфиг: неизвестные поля, `baseUrl` без
+`http(s)://`, учётные данные в URL, `model` с пробелами, а также открытый
+`http` с `apiKeyEnv` на не-loopback хосте — ошибки конфигурации (маршрутизация
+ставится на паузу, модель сессии сохраняется). Отсутствующая переменная ключа —
+**предупреждение**, и на этапе вызова выполняется откат. Дубликаты записей
+выводятся как предупреждения. Ключи не попадают в конфиг, логи, статистику и
+вывод команд.
+
+**Как выполняются прямые вызовы (`llm_execution`).** Объектные записи выполняет
+сам плагин на своём endpoint; инструменты поддерживаются в обоих API-режимах.
+Откат (fail-open) безусловный: при любой ошибке запрос повторяется через модель,
+которую Hermes собирался использовать, а причина учитывается в статистике:
+`timeout`, `connection`, `http_<статус>`, `invalid_json`, `invalid_stream`,
+`stream_error`, `invalid_response`, `empty_response`, `missing_key`,
+`unsupported_request`, `provider_override_not_granted`, `internal_error`.
+
+- Hermes по умолчанию запрашивает стрим. Прямые вызовы тоже идут стримом к
+  endpoint, но ответ собирается целиком до передачи Hermes, поэтому для
+  маршрутизируемых прямых вызовов не показывается потокового вывода по токенам.
+- Вызовы `anthropic_messages` к endpoint — без стрима; изображения не конвертируются.
+- Опции запроса, специфичные для OpenRouter (`extra_body`, предпочтения провайдера),
+  на прямые endpoint'ы не передаются; нужное endpoint'у задавайте в `extraBody`.
+- Прямым endpoint'ам нужна capability **`llm.provider_override`**. Она объявлена
+  при установке (экран согласия). Установка, обновлённая с 0.2.x, должна получить
+  её явно: `hermes plugins capabilities cortiq-hermes-router`. До этого прямые
+  записи пропускаются с однократным предупреждением, а модель **не** подменяется
+  локальным id.
+- Автономный прокси из `standalone/` принимает только строковые записи.
+
+**Проверка endpoint'ов без расхода токенов**
+
+```text
+/cortiq-router providers              GET {baseUrl}/models, таймаут 3 с, без completion;
+                                      ключ показывается только как «set» или «MISSING»
+/cortiq-router test <тир|провайдер>   один промпт, max_tokens=8; только по вашей команде
+```
+
+## Контроль стоимости
+
+Один ход пользователя может сделать десятки вызовов провайдера (цикл
+инструментов). Роутер классифицирует ход один раз и не переклассифицирует
+каждый шаг инструмента:
+
+| Вызов внутри хода (`api_call_count`) | Выбор модели |
+| --- | --- |
+| `1` (первый вызов) | классификация, затем тир и `taskRules` как обычно |
+| `2` и далее (продолжение цикла инструментов) | **без вызова классификатора**; первая запись `globalTiers.low`, а если она пуста — `defaultModel`; `taskRules` не учитываются |
+| новый ход (новый `turn_id`) | классификация заново |
+
+Повторы внутри одного хода используют решение этого хода из кэша. Если
+`api_call_count` не передан, вызов считается первым.
+
+Выбирайте запись `low` осознанно: она обслуживает все шаги инструментов длинных
+ходов. Берите самую дешёвую модель, которая надёжно формирует вызовы инструментов.
+В статистике шаги инструментов видны как `step_continuation_count` (итоги и по
+дням), колонка `Tool step` в `stats recent` и статус `step_continuation`.
 
 ## Слеш-команда
 
@@ -168,6 +284,8 @@ echo 'CORTIQ_ROUTER_KEY=ваш-ключ-allaigate' >> ~/.hermes/.env
 /cortiq-router stats --json      полный машиночитаемый агрегат
 /cortiq-router stats reset       безопасный запрос подтверждения
 /cortiq-router stats reset yes   очистить статистику, сохранить last_decision
+/cortiq-router providers              configured endpoints: GET {baseUrl}/models, без completion, ключи скрыты
+/cortiq-router test <тир|провайдер>   один дешёвый промпт через этот endpoint (только по команде)
 /cortiq-router decide <промпт>   классификация без маршрутизации (JSON)
 /cortiq-router on | off          вкл/выкл маршрутизацию профиля
 /cortiq-router help              справка
@@ -293,6 +411,13 @@ Timestamp                 Status              Task          Score   Tier  Model 
 }
 ```
 
+Шаги инструментов и прямые endpoint'ы видны в агрегате: `by_provider` считает
+маршрутизированные решения по endpoint'ам (`openrouter` для строковых записей),
+а `execution_fallback_count`, `fallback_reasons` и `fallback_by_provider`
+считают прямые вызовы, по которым сработал откат. `step_continuation_count`
+считает шаги инструментов без классификации. Статистика, записанная в 0.2.x,
+обновляется на месте.
+
 ## Автономный OpenAI-compatible прокси (опционально)
 
 Для харнесов вне Hermes — Codex, Cline, OpenCode, скриптов — те же механики
@@ -327,9 +452,10 @@ node dist/server.js serve            # http://127.0.0.1:8791
 ## Тесты и проверки
 
 ```sh
-python3 -m unittest discover -s tests -t .     # выбор/конфиг/классификация/персистентная статистика
+python3 -m unittest discover -s tests -t .     # 136 тестов: выбор, конфиг, провайдеры, HTTP-исполнение, контроль стоимости, статистика, слеш
 cd standalone && npm run check                 # lint + build + 61 юнит-тест
 hermes plugins validate .                      # каталог-гейт: probe + security scan
+hermes plugins doctor .                        # реальные контракты рантайма (импорт + регистрация)
 ```
 
 Полные реальные доказательства — три тира, параллельные стримы, пустые/
