@@ -1,0 +1,23 @@
+{
+  "enabled": true,
+  "apiKeyEnv": "CORTIQ_ROUTER_KEY",
+  "routerUrl": "https://router.allaigate.com",
+  "taxonomyId": "data-assistant",
+  "timeoutMs": 15000,
+  "maxChars": 12000,
+  "routerProfile": "balanced",
+  "globalTiers": {
+    "low": ["xiaomi/mimo-v2.6-flash"],
+    "medium": ["anthropic/claude-haiku-5.5"],
+    "high": ["moonshotai/kimi-k3.1-pro"]
+  },
+  "taskRules": {
+    "coding": {
+      "low": ["xiaomi/mimo-v2.6-flash"],
+      "high": ["moonshotai/kimi-k3.1-pro"],
+      "any": ["anthropic/claude-haiku-5.5"]
+    }
+  },
+  "defaultModel": "xiaomi/mimo-v2.6-flash",
+  "echoRouting": false
+}

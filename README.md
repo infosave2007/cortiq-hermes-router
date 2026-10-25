@@ -1,0 +1,229 @@
+# Automatic model selection for Hermes
+
+[Русский](README.ru.md)
+
+[![CI](https://github.com/infosave2007/cortiq-hermes-router/actions/workflows/ci.yml/badge.svg)](https://github.com/infosave2007/cortiq-hermes-router/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Hermes plugin](https://img.shields.io/badge/Hermes-plugin-6f42c1.svg)](https://hermes-agent.nousresearch.com/docs)
+[![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776ab?logo=python&logoColor=white)](https://www.python.org/)
+
+**A Hermes plugin that picks the right model for every turn.**
+Your rules send routine requests to an inexpensive model and hard problems to a
+strong one — [AllaiGate](https://api.allaigate.com/) classifies the request
+(task type + complexity 0…1), the plugin applies the family routing schema
+(`taskRules` → `globalTiers` → `defaultModel`) and rewrites the outgoing
+model **inside the Hermes process**. No proxy, no port, no second daemon.
+
+Example rules — you choose the models:
+
+| Task and estimate | Your choice |
+| --- | --- |
+| Routine request, low estimated complexity | Your lower-cost model |
+| Coding task, high estimated complexity | Your stronger coding model |
+
+In a [live test on 25 October 2026](docs/live-verification.md) three real
+prompts were routed low → medium → high: `xiaomi/mimo-v2.6-flash`
+(score 0.2513) → `anthropic/claude-haiku-5.5` (0.3393) →
+`moonshotai/kimi-k3.1-pro` (0.6061) — each completion verified by the
+`model` field of the upstream SSE response.
+
+## How it works
+
+```text
+   you: "translate this…"                       you: "design exactly-once dedup…"
+         │                                              │
+         ▼                                              ▼
+┌──────────────────────── Hermes turn ───────────────────────────────┐
+│  cortiq-hermes-router · llm_request middleware (in-process)        │
+│                                                                    │
+│   1. classify   POST {routerUrl}/v1/route   ← CORTIQ_ROUTER_KEY    │
+│        → { task, complexity.score, complexity.tier }                │
+│   2. select     taskRules → globalTiers → defaultModel              │
+│        (complexityBands optional; default = router tier)            │
+│   3. rewrite    request.model = chosen model                        │
+│        classifier down → defaultModel → your current model          │
+└───────────────┬────────────────────────────────────┬───────────────┘
+                ▼                                    ▼
+      xiaomi/mimo-v2.6-flash              moonshotai/kimi-k3.1-pro
+        (low tier)                              (high tier)
+                │                                    │
+                └──────────► OpenRouter ◄────────────┘
+                          (your provider, unchanged)
+```
+
+- **Classification is bounded**: only the last user message goes to the
+  classifier, truncated to `maxChars`, with a `timeoutMs` deadline; repeated
+  turns reuse an in-process decision cache.
+- **Provider untouched**: `model.provider`, credentials and `base_url` stay
+  exactly as you configured them — only the `model` id inside the request
+  changes, and only when the classifier answered.
+- **Fail-open**: classifier timeout/HTTP error/invalid payload → your
+  `defaultModel`; no `defaultModel` → the current model; invalid config → one
+  clear warning and routing pauses. The turn never fails because of routing.
+- **Nothing leaves your machine except the classification text** (capped at
+  `maxChars`) to the router you configured.
+
+## Install
+
+Requires a working [Hermes Agent](https://hermes-agent.nousresearch.com/docs)
+and an AllaiGate API key.
+
+### One command (recommended)
+
+```sh
+hermes plugins install infosave2007/cortiq-hermes-router
+hermes plugins enable cortiq-hermes-router
+```
+
+`install` accepts a Git URL or the `owner/repo` shorthand, runs the security
+scan and the capability probe, and shows the consent screen for the declared
+capability `llm.model_override` (“choose which model host-owned LLM calls
+use”). Pin an immutable commit with `--ref <40-char SHA>`; non-interactive
+installs leave capabilities ungranted until you run
+`hermes plugins capabilities cortiq-hermes-router`.
+
+### Manual (Git checkout)
+
+```sh
+git clone https://github.com/infosave2007/cortiq-hermes-router.git \
+  "${HERMES_HOME:-$HOME/.hermes}/plugins/cortiq-hermes-router"
+hermes plugins enable cortiq-hermes-router
+```
+
+### Into the official catalog
+
+The curated catalog lives in [`NousResearch/hermes-agent`
+`plugin-catalog/`](https://github.com/NousResearch/hermes-agent) — to publish
+there: open a PR adding `plugin-catalog/cortiq-hermes-router.yaml` (name,
+description, `update_url` pointing at this repository and the 40-character
+commit SHA pin), pass `hermes plugins validate <path>` and the catalog CI.
+Until then the two install paths above work today.
+
+If the gateway is already running, restart it **from an external shell**:
+`hermes gateway restart`. Gateway lifecycle commands are blocked inside a
+chat session — do not run them from chat.
+
+## Configure
+
+Put your AllaiGate key in the environment that starts Hermes (never in this
+repository):
+
+```sh
+echo 'CORTIQ_ROUTER_KEY=your-allaigate-key' >> ~/.hermes/.env
+```
+
+Routing settings live in `~/.config/cortiq-hermes-router/config.json`
+(`CORTIQ_ROUTER_CONFIG` selects another file). Start from
+[cortiq-router.example.json](cortiq-router.example.json):
+
+```json
+{
+  "globalTiers": {
+    "low": ["xiaomi/mimo-v2.6-flash"],
+    "medium": ["anthropic/claude-haiku-5.5"],
+    "high": ["moonshotai/kimi-k3.1-pro"]
+  },
+  "taskRules": {},
+  "defaultModel": "xiaomi/mimo-v2.6-flash"
+}
+```
+
+Model ids must be valid **for your provider** (for OpenRouter:
+`provider/model`, e.g. `anthropic/claude-haiku-5.5`).
+
+| Setting | Default / meaning |
+| --- | --- |
+| `enabled` | `true`; explicit `false` disables future routing |
+| `apiKeyEnv` | `CORTIQ_ROUTER_KEY` |
+| `routerUrl` | `https://router.allaigate.com`; `/v1/route` is appended |
+| `taxonomyId` | `data-assistant` |
+| `timeoutMs` | `15000`; integer 1–120000 ms |
+| `maxChars` | `12000`; integer 1–1000000 UTF-16 code units |
+| `routerProfile` | `balanced`, `cost-saver`, or `quality-first` |
+| `complexityBands` | Omitted (default): use the router tier. Optional `{ "low": 0.35, "medium": 0.65 }` overrides score thresholds |
+| `globalTiers` | Empty; arrays for `low`, `medium`, `high` |
+| `taskRules` | Empty; task label → model string/array or tier object with `low`, `medium`, `high`, `any` (`models` is an alias for `any`) |
+| `defaultModel` | Unset; last candidate and classifier-error fallback |
+| `echoRouting` | `false`; log each routing decision (`task=…;score=…;model=…`) |
+
+Priority for a classified turn: the task's models **for the resolved tier**
+first; at `high` the global `high` chain precedes the task's `any` models
+(escalation is never undercut), at `low`/`medium` the task's `any` models go
+first; `defaultModel` is the last candidate. Duplicates are dropped, empty
+entries ignored. The classifier decides the tier — decisions are used 1:1.
+
+## Slash command
+
+```text
+/cortiq-router status            config, keys, last routing decision
+/cortiq-router decide <prompt>   classify without routing (prints JSON)
+/cortiq-router on | off          toggle routing for this profile
+/cortiq-router help              usage
+```
+
+`decide` output shape:
+
+```json
+{
+  "task": "qa", "score": 0.3393, "tier": "medium",
+  "model": "anthropic/claude-haiku-5.5",
+  "candidates": ["anthropic/claude-haiku-5.5"],
+  "fallback": false, "classifier": "ok",
+  "source": "router", "requestId": "req_…", "profile": "balanced"
+}
+```
+
+## Standalone OpenAI-compatible proxy (optional)
+
+For harnesses that are not Hermes — Codex, Cline, OpenCode, scripts — the same
+mechanics ship as a dependency-free Node proxy in [standalone/](standalone/):
+
+```sh
+cd standalone && npm ci
+node dist/server.js serve            # http://127.0.0.1:8791
+```
+
+- `POST /v1/chat/completions` is classified and re-routed; every other
+  `/v1/*` path passes through untouched (`GET /v1/models` works).
+- Responses stream back **byte-for-byte** (`text/event-stream`), adding only
+  the `X-Cortiq-Router: task=…;score=…;model=…` response header.
+- Upstream connection refused/timeout → `502` with
+  `{"error":{…,"code":"upstream_unavailable"}}`; the process stays up.
+- Subcommands: `setup` (prints the exact `hermes config set` commands that
+  point Hermes at the proxy — with your current values shown, keys masked, and
+  a backup written to `~/.config/cortiq-hermes-router/hermes-backup.json`;
+  `--apply` executes them), `decide "<prompt>"` (dry-run JSON), `status`
+  (config/env/upstream/classifier checks). Flags: `--port`, `--host`,
+  `--config`; config env: `CORTIQ_ROUTER_CONFIG`.
+- Extra config keys understood **by the proxy only**: `host` (default
+  `127.0.0.1`), `port` (default `8791`), `upstream` `{ "url":
+  "https://openrouter.ai/api/v1", "apiKeyEnv": "OPENROUTER_API_KEY",
+  "timeoutMs": 0 }` (0 = no overall deadline). The upstream key is read from
+  the environment — never from files in this repository.
+
+For Hermes users the plugin is the recommended path: no port, no second
+process, no `base_url` rewrite.
+
+## Tests and validation
+
+```sh
+python3 -m unittest discover -s tests -t .     # pure selection/config/classify logic
+cd standalone && npm run check                 # lint + build + 61 unit tests
+hermes plugins validate .                      # catalog gate: probe + security scan
+```
+
+Full real-world evidence — three tiers, concurrent streams, empty/oversized/
+message-less requests, dead upstream, dead classifier, invalid config,
+graceful shutdown — is in [docs/live-verification.md](docs/live-verification.md).
+
+## Contributing
+
+Issues and PRs welcome. Keep the two test suites green, run
+`hermes plugins validate .` before opening a PR, never commit secrets (only
+environment variable names), and keep the README pair in sync — English here,
+Russian in [README.ru.md](README.ru.md).
+
+## License
+
+[MIT](LICENSE) © 2026 Cortiq Team.

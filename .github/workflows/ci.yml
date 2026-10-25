@@ -1,0 +1,37 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  plugin:
+    name: plugin (python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Unit tests
+        run: python -m unittest discover -s tests -t . -v
+      - name: Syntax check
+        run: python -m compileall -q cortiq_router __init__.py
+
+  proxy:
+    name: standalone proxy (node)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: standalone
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.2'
+          cache: npm
+          cache-dependency-path: standalone/package-lock.json
+      - run: npm ci
+      - run: npm run check
+      - name: Verify committed build
+        run: git diff --exit-code -- standalone/dist

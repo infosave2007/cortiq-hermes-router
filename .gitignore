@@ -1,0 +1,12 @@
+node_modules/
+__pycache__/
+*.pyc
+*.tgz
+*.log
+.env
+.env.*
+coverage/
+.DS_Store
+.smoke-*/
+.live-*/
+.test-*/
