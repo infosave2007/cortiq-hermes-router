@@ -326,35 +326,37 @@ cortiq-hermes-router statistics (UTC; week = today + previous 6 days)
 
 Period  Calls  Fallback  Avg score  Avg cls ms  Max cls ms
 ------  -----  --------  ---------  ----------  ----------
-today   3      1         0.4287     543.2       1500.0
-week    3      1         0.4287     543.2       1500.0
-all     3      1         0.4287     543.2       1500.0
+today   685    0         0.4176     1731.1      9840.2
+week    1485   0         0.4184     1558.5      9840.2
+all     1485   0         0.4184     1558.5      9840.2
 
 All time · By tier
 Name    Count
 ------  -----
-(none)  1
-high    1
-low     1
+low     1445
+medium  29
+high    11
 
 All time · By task
-Name          Count
-------------  -----
-code          1
-translation   1
-unclassified  1
+Name      Count
+--------  -----
+(none)    1354
+chitchat  102
+code      22
+qa        7
 
 All time · By model
-Name                      Count
-------------------------  -----
-xiaomi/mimo-v2.6-flash    2
-moonshotai/kimi-k3.1-pro  1
+Name                        Count
+--------------------------  -----
+xiaomi/mimo-v2.6-flash      1445
+anthropic/claude-haiku-5.5  29
+moonshotai/kimi-k3.1-pro    11
 
 All time · By status
-Name                Count
-------------------  -----
-ok                  2
-classifier_timeout  1
+Name               Count
+-----------------  -----
+step_continuation  1354
+ok                 131
 ```
 
 `stats today`, `stats week`, or `stats all` selects one period for both the
@@ -364,10 +366,10 @@ summary and all four breakdowns. Recent output is newest first:
 /cortiq-router stats recent 2
 
 cortiq-hermes-router recent decisions (newest first, UTC)
-Timestamp                 Status              Task          Score   Tier  Model                     Fallback  Cls ms  Original model
-------------------------  ------------------  ------------  ------  ----  ------------------------  --------  ------  ----------------------
-2026-10-25T12:00:02.000Z  classifier_timeout  unclassified  -       -     xiaomi/mimo-v2.6-flash    yes       1500.0  deepseek/deepseek-v3.2
-2026-10-25T12:00:01.000Z  ok                  code          0.6061  high  moonshotai/kimi-k3.1-pro  no        87.4    deepseek/deepseek-v3.2
+Timestamp                 Status  Task      Score   Tier    Model                       Fallback  Cls ms  Original model          Provider  Tool step
+------------------------  ------  --------  ------  ------  --------------------------  --------  ------  ----------------------  --------  ---------
+2026-10-26T07:09:18.742Z  ok      code      0.4796  medium  anthropic/claude-haiku-5.5  no        2855.1  xiaomi/mimo-v2.6-flash  -         no
+2026-10-26T07:04:35.657Z  ok      chitchat  0.4522  medium  anthropic/claude-haiku-5.5  no        9840.2  xiaomi/mimo-v2.6-flash  -         no
 ```
 
 `stats --json` emits the complete `version`, `timezone`, `totals`, `daily`, and
@@ -376,17 +378,17 @@ aggregate shape):
 
 ```json
 {
-  "calls": 3,
-  "by_tier": {"low": 1, "high": 1, "(none)": 1},
-  "by_task": {"translation": 1, "code": 1, "unclassified": 1},
-  "by_model": {"xiaomi/mimo-v2.6-flash": 2, "moonshotai/kimi-k3.1-pro": 1},
-  "by_status": {"ok": 2, "classifier_timeout": 1},
-  "fallback_count": 1,
-  "avg_score": 0.4287,
-  "score_count": 2,
-  "avg_classifier_latency_ms": 543.167,
-  "classifier_latency_count": 3,
-  "max_classifier_latency_ms": 1500.0
+  "calls": 1485,
+  "by_tier": {"low": 1445, "medium": 29, "high": 11},
+  "by_task": {"(none)": 1354, "chitchat": 102, "code": 22, "qa": 7},
+  "by_model": {"xiaomi/mimo-v2.6-flash": 1445, "anthropic/claude-haiku-5.5": 29, "moonshotai/kimi-k3.1-pro": 11},
+  "by_status": {"step_continuation": 1354, "ok": 131},
+  "fallback_count": 0,
+  "avg_score": 0.418444,
+  "score_count": 131,
+  "avg_classifier_latency_ms": 1558.541,
+  "classifier_latency_count": 131,
+  "max_classifier_latency_ms": 9840.241
 }
 ```
 
@@ -394,15 +396,17 @@ Each recent JSON entry has the following fields (shown in full):
 
 ```json
 {
-  "timestamp": "2026-10-25T12:00:00.000Z",
-  "task": "translation",
-  "score": 0.2513,
-  "tier": "low",
-  "model": "xiaomi/mimo-v2.6-flash",
-  "originalModel": "deepseek/deepseek-v3.2",
+  "timestamp": "2026-10-26T07:09:18.742Z",
+  "task": "code",
+  "score": 0.47955617,
+  "tier": "medium",
+  "model": "anthropic/claude-haiku-5.5",
+  "originalModel": "xiaomi/mimo-v2.6-flash",
   "fallback": false,
   "status": "ok",
-  "classifier_latency_ms": 42.1
+  "classifier_latency_ms": 2855.147,
+  "provider": null,
+  "step_continuation": false
 }
 ```
 
