@@ -76,7 +76,8 @@ class ValidationTests(unittest.TestCase):
     def test_model_id_format(self):
         self.assertEqual(parse_config({"defaultModel": "deepseek/deepseek-chat"})["defaultModel"],
                          "deepseek/deepseek-chat")
-        for bad in ("no-slash", "a/b c", "/leading", 42):
+        self.assertEqual(parse_config({"defaultModel": "gpt-6-luna"})["defaultModel"], "gpt-6-luna")
+        for bad in ("a/b c", "   ", 42):
             with self.assertRaises(ConfigError):
                 parse_config({"defaultModel": bad})
 
@@ -101,7 +102,14 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             parse_config({"globalTiers": {"ultra": ["a/b"]}})
         with self.assertRaises(ConfigError):
-            parse_config({"globalTiers": {"low": ["missing-slash"]}})
+            parse_config({"globalTiers": {"low": ["bad model"]}})
+        # ChatGPT/Codex model ids are bare, unlike OpenRouter's provider/model ids.
+        cfg = parse_config({"globalTiers": {"low": ["gpt-6-luna"],
+                                              "medium": ["gpt-5.6-terra"]},
+                            "defaultModel": "gpt-6-luna"})
+        self.assertEqual(cfg["globalTiers"]["low"], ["gpt-6-luna"])
+        self.assertEqual(cfg["globalTiers"]["medium"], ["gpt-5.6-terra"])
+        self.assertEqual(cfg["defaultModel"], "gpt-6-luna")
 
     def test_task_rules_shape(self):
         cfg = parse_config({"taskRules": {
@@ -109,10 +117,12 @@ class ValidationTests(unittest.TestCase):
             "chitchat": "g/h",
         }})
         self.assertEqual(cfg["taskRules"]["chitchat"], "g/h")
+        self.assertEqual(parse_config({"taskRules": {"coding": {"low": ["gpt-6-luna"]}}})
+                         ["taskRules"]["coding"]["low"], ["gpt-6-luna"])
         with self.assertRaises(ConfigError):
             parse_config({"taskRules": {"coding": {"wrong": ["a/b"]}}})
         with self.assertRaises(ConfigError):
-            parse_config({"taskRules": {"coding": {"low": ["nope"]}}})
+            parse_config({"taskRules": {"coding": {"low": ["bad model"]}}})
 
     def test_boolean_fields_must_be_booleans(self):
         with self.assertRaises(ConfigError):

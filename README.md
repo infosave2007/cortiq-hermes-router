@@ -132,8 +132,9 @@ Routing settings live in `~/.config/cortiq-hermes-router/config.json`
 }
 ```
 
-Model ids must be valid **for your provider** (for OpenRouter:
-`provider/model`, e.g. `anthropic/claude-haiku-5.5`).
+Model ids are forwarded unchanged to Hermes' active provider. OpenRouter uses
+`provider/model` ids (for example `anthropic/claude-haiku-5.5`); ChatGPT/Codex
+uses bare ids such as `gpt-6-luna` and `gpt-5.6-terra`.
 
 | Setting | Default / meaning |
 | --- | --- |

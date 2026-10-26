@@ -30,7 +30,10 @@ RESERVED_EXTRA_BODY_KEYS: tuple[str, ...] = ("model", "messages", "stream")
 LOOPBACK_HOSTS: tuple[str, ...] = ("localhost", "127.0.0.1", "::1")
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_MODEL_ID = re.compile(r"^[^/\s]+/\S+$")
+# Managed-model strings are forwarded verbatim to Hermes' active provider.
+# OpenRouter ids are normally ``provider/model``, while ChatGPT/Codex uses
+# bare ids such as ``gpt-6-luna`` and ``gpt-5.6-terra``. Both must be valid.
+_MODEL_ID = re.compile(r"^(?:[^/\s]+/\S+|[^/\s]+)$")
 
 #: Defaults — the family defaults table (owner's source of truth).
 DEFAULTS: dict[str, Any] = {

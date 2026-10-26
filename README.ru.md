@@ -134,8 +134,9 @@ echo 'CORTIQ_ROUTER_KEY=ваш-ключ-allaigate' >> ~/.hermes/.env
 }
 ```
 
-Идентификаторы моделей должны подходить **вашему провайдеру** (для OpenRouter —
-`provider/model`, например `anthropic/claude-haiku-5.5`).
+ID модели передаётся без изменений активному провайдеру Hermes. OpenRouter
+использует ID `provider/model` (например `anthropic/claude-haiku-5.5`), а
+ChatGPT/Codex — обычные ID `gpt-6-luna` и `gpt-5.6-terra`.
 
 | Настройка | Значение по умолчанию / смысл |
 | --- | --- |
