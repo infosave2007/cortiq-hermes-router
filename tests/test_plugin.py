@@ -256,7 +256,12 @@ class DirectExecutionTests(PluginTestCase):
         self.ctx.capabilities = {"llm.model_override"}  # provider_override withdrawn
         self.ctx.middlewares.clear()  # re-register: fresh caches, single callback
         self.ctx.config.clear()
-        _load_plugin_module().register(self.ctx)
+        # Re-register the SAME module setUp patched: register() always builds a fresh
+        # cache (capability/config lookups re-run), while a second `_load_plugin_module()`
+        # would drop the classify_detailed patch and send a real network request — the
+        # test then depends on CORTIQ_ROUTER_KEY being present, which is exactly how it
+        # failed in CI.
+        self.plugin.register(self.ctx)
         self._direct_config()
         sent = self.request(api_call_count=1, turn_id="t1")
         result, _terminal = self._execute(sent)
