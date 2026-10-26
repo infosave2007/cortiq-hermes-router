@@ -68,6 +68,24 @@ class ProviderEntryTests(unittest.TestCase):
         self.assertEqual(anthropic["baseUrl"], "https://api.anthropic.com")
         self.assertEqual(anthropic["apiKeyEnv"], "ANTHROPIC_API_KEY")
 
+    def test_explicit_native_provider_entry_has_no_direct_endpoint(self):
+        config = parse_config({"globalTiers": {"medium": [{
+            "provider": "openai-codex", "model": "gpt-5.6-terra", "native": True,
+        }]}})
+        entry = normalize_entry(config["globalTiers"]["medium"][0])
+        self.assertTrue(entry["native"])
+        self.assertFalse(entry["direct"])
+        self.assertEqual(entry["routeKind"], "native")
+        self.assertEqual(entry["provider"], "openai-codex")
+        self.assertIsNone(entry["baseUrl"])
+
+    def test_native_entry_rejects_direct_endpoint_fields(self):
+        with self.assertRaises(ConfigError):
+            parse_config({"globalTiers": {"low": [{
+                "provider": "openai-codex", "model": "gpt-6-luna", "native": True,
+                "baseUrl": "https://example.test/v1",
+            }]}})
+
     def test_object_entries_are_valid_in_tiers_rules_and_default(self):
         config = parse_config({
             "globalTiers": {"low": [local_entry()]},

@@ -79,6 +79,22 @@ def _ensure_provider_entry(value: Any, path_: str) -> None:
         _invalid(f"{path_}.provider")
     if not isinstance(model, str) or not model.strip() or any(ch.isspace() for ch in model):
         _invalid(f"{path_}.model")
+    native = value.get("native", False)
+    if not isinstance(native, bool):
+        _invalid(f"{path_}.native")
+    if native:
+        # Native overrides are resolved by Hermes from its configured provider
+        # credentials; mixing endpoint fields would silently select the wrong
+        # transport, so reject the ambiguous schema.
+        forbidden = {"baseUrl", "apiKeyEnv", "apiMode", "extraBody"}.intersection(value)
+        if forbidden:
+            _invalid(f"{path_}.native (cannot combine with {sorted(forbidden)[0]})")
+        timeout = value.get("timeoutMs")
+        if timeout is not None and (
+            not isinstance(timeout, int) or isinstance(timeout, bool) or not 1 <= timeout <= 120000
+        ):
+            _invalid(f"{path_}.timeoutMs")
+        return
     if value.get("baseUrl") is not None:
         base_url = value["baseUrl"]
         if not isinstance(base_url, str):

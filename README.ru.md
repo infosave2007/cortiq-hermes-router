@@ -55,9 +55,10 @@
 - **Классификация ограничена**: на роутер уходит только последнее
   пользовательское сообщение, обрезанное до `maxChars`, с дедлайном
   `timeoutMs`; повторные ходы используют внутренний кеш решений.
-- **Провайдер не трогаем**: `model.provider`, ключи и `base_url` остаются как
-  настроены — меняется только идентификатор `model` внутри запроса и только
-  когда классификатор ответил.
+- **Явные режимы маршрута**: строка оставляет текущий provider Hermes,
+  `native: true` выбирает другой настроенный provider Hermes, а объект endpoint
+  выполняет прямой вызов со своим URL/ключом. Объект провайдера никогда не
+  интерпретируется молча как строка модели.
 - **Fail-open**: таймаут/HTTP-ошибка/некорректный ответ классификатора →
   ваша `defaultModel`; без `defaultModel` → текущая модель; битый конфиг →
   одно понятное предупреждение и пауза маршрутизации. Ход никогда не падает
@@ -125,14 +126,19 @@ echo 'CORTIQ_ROUTER_KEY=ваш-ключ-allaigate' >> ~/.hermes/.env
 ```json
 {
   "globalTiers": {
-    "low": ["xiaomi/mimo-v2.6-flash"],
-    "medium": ["anthropic/claude-haiku-5.5"],
-    "high": ["moonshotai/kimi-k3.1-pro"]
+    "low": ["gpt-6-luna"],
+    "medium": ["gpt-5.6-terra"],
+    "high": [{ "provider": "openrouter", "model": "moonshotai/kimi-k3.1-pro" }]
   },
   "taskRules": {},
-  "defaultModel": "xiaomi/mimo-v2.6-flash"
+  "defaultModel": "gpt-6-luna"
 }
 ```
+
+Это безопасная смешанная конфигурация для активного Hermes
+`openai-codex` / `codex_responses`: low и medium остаются на авторизованном
+ChatGPT/Codex, а high делает реальный запрос в OpenRouter. Ключ
+`OPENROUTER_API_KEY` читается только в момент вызова; не записывайте его в JSON.
 
 ID модели передаётся без изменений активному провайдеру Hermes. OpenRouter
 использует ID `provider/model` (например `anthropic/claude-haiku-5.5`), а
@@ -161,8 +167,23 @@ ChatGPT/Codex — обычные ID `gpt-6-luna` и `gpt-5.6-terra`.
 
 ## Провайдеры и локальные модели
 
-Запись тира — это либо **строка** (id модели OpenRouter, идёт через собственный
-клиент Hermes, как и в 0.2.x), либо **объект**, который задаёт свой endpoint:
+Запись тира имеет три явные формы:
+
+1. **строка** — модель через текущий provider Hermes (обратная совместимость);
+2. **объект прямого endpoint'а** — отдельный URL/пресет провайдера;
+3. **native provider override** — другой уже настроенный provider Hermes без URL:
+
+```json
+{ "provider": "openai-codex", "model": "gpt-6-luna", "native": true }
+```
+
+У `native: true` разрешены только `provider`, `model`, необязательный
+`timeoutMs` и `native`; сочетать его с `baseUrl`, `apiKeyEnv`, `apiMode` или
+`extraBody` нельзя. Это намеренно строгая схема: она исключает незаметное
+несовпадение provider/endpoint. Native override использует credentials Hermes,
+а direct object читает только свой ключ из переменной окружения в момент вызова.
+
+Объект прямого endpoint'а задаёт свой endpoint:
 
 ```json
 {
@@ -196,6 +217,7 @@ ChatGPT/Codex — обычные ID `gpt-6-luna` и `gpt-5.6-terra`.
 | Поле | Значение |
 | --- | --- |
 | `provider` | обязательно; имя пресета или любая метка для явного `baseUrl` |
+| `native` | необязательный `true`: использовать настроенный Hermes provider; нельзя сочетать с endpoint/auth полями |
 | `model` | обязательно; id, который ждёт endpoint (префикс `provider/` для локальных серверов не нужен) |
 | `baseUrl` | `http(s)://…/v1`; берётся из пресета; **обязателен** для `vllm`, `llamacpp` и неизвестных провайдеров |
 | `apiKeyEnv` | **имя** переменной окружения с ключом — не сам ключ |
@@ -238,8 +260,14 @@ ChatGPT/Codex — обычные ID `gpt-6-luna` и `gpt-5.6-terra`.
   endpoint, но ответ собирается целиком до передачи Hermes, поэтому для
   маршрутизируемых прямых вызовов не показывается потокового вывода по токенам.
 - Вызовы `anthropic_messages` к endpoint — без стрима; изображения не конвертируются.
-- Опции запроса, специфичные для OpenRouter (`extra_body`, предпочтения провайдера),
-  на прямые endpoint'ы не передаются; нужное endpoint'у задавайте в `extraBody`.
+- При активном `codex_responses` прямые Chat Completions и Anthropic вызовы
+  получают преобразованные `instructions`/`input`/Responses tools, а ответ
+  адаптируется обратно в совместимый объект Responses `output`. Неподдерживаемые
+  item'ы дают fail-open `unsupported_request`; поля Responses никогда не уходят
+  в endpoint Chat Completions.
+- Native provider override использует фасад Hermes `ctx.llm` только для text-only
+  ходов. Ход с tools делает fail-open `native_tools_unsupported`, а не теряет
+  контракт инструментов молча.
 - Прямым endpoint'ам нужна capability **`llm.provider_override`**. Она объявлена
   при установке (экран согласия). Установка, обновлённая с 0.2.x, должна получить
   её явно: `hermes plugins capabilities cortiq-hermes-router`. До этого прямые
@@ -365,8 +393,8 @@ step_continuation  1354
 ok                 131
 ```
 
-`stats today`, `stats week` или `stats all` выбирает период и для сводки, и для
-четырёх разбивок. `recent` показывает сначала новые решения:
+`stats today`, `stats week` или `stats all` выбирает период для сводки и всех
+разбивок. `recent` показывает сначала новые решения:
 
 ```text
 /cortiq-router stats recent 2
@@ -389,6 +417,8 @@ Timestamp                 Status  Task      Score   Tier    Model               
   "by_task": {"(none)": 1354, "chitchat": 102, "code": 22, "qa": 7},
   "by_model": {"xiaomi/mimo-v2.6-flash": 1445, "anthropic/claude-haiku-5.5": 29, "moonshotai/kimi-k3.1-pro": 11},
   "by_status": {"step_continuation": 1354, "ok": 131},
+  "by_provider": {"openai-codex": 1445, "openrouter": 40},
+  "by_route_kind": {"native": 1445, "direct": 40},
   "fallback_count": 0,
   "avg_score": 0.418444,
   "score_count": 131,
@@ -412,16 +442,17 @@ Timestamp                 Status  Task      Score   Tier    Model               
   "status": "ok",
   "classifier_latency_ms": 2855.147,
   "provider": null,
+  "route_kind": "native",
   "step_continuation": false
 }
 ```
 
-Шаги инструментов и прямые endpoint'ы видны в агрегате: `by_provider` считает
-маршрутизированные решения по endpoint'ам (`openrouter` для строковых записей),
-а `execution_fallback_count`, `fallback_reasons` и `fallback_by_provider`
-считают прямые вызовы, по которым сработал откат. `step_continuation_count`
-считает шаги инструментов без классификации. Статистика, записанная в 0.2.x,
-обновляется на месте.
+Шаги инструментов и исходы endpoint'ов видны в агрегате: `by_provider` показывает
+фактически выбранный provider (включая активный Hermes provider для строк),
+`by_route_kind` разделяет `native`, `direct`, `unchanged` и `fallback`, а
+`execution_fallback_count`, `fallback_reasons` и `fallback_by_provider` считают
+попытки direct/native с fail-open. В recent есть provider и route kind. Старые
+statistics 0.2.x/0.3.x обновляются на месте без потери counters.
 
 ## Автономный OpenAI-compatible прокси (опционально)
 
@@ -457,7 +488,7 @@ node dist/server.js serve            # http://127.0.0.1:8791
 ## Тесты и проверки
 
 ```sh
-python3 -m unittest discover -s tests -t .     # 136 тестов: выбор, конфиг, провайдеры, HTTP-исполнение, контроль стоимости, статистика, слеш
+python3 -m unittest discover -s tests -t .     # выбор, конфиг, смешанные providers, HTTP-исполнение, контроль стоимости, статистика, слеш
 cd standalone && npm run check                 # lint + build + 61 юнит-тест
 hermes plugins validate .                      # каталог-гейт: probe + security scan
 hermes plugins doctor .                        # реальные контракты рантайма (импорт + регистрация)

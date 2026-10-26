@@ -25,8 +25,15 @@ def _content_to_text(content: Any) -> str:
     return ""
 
 
-def extract_last_user_text(messages: Any) -> str:
-    """Text of the last ``role: "user"`` message from an OpenAI ``messages`` array."""
+def extract_last_user_text(payload: Any) -> str:
+    """Last user text from Chat Completions messages or a Responses API request."""
+    if isinstance(payload, dict) and isinstance(payload.get("input"), list):
+        for item in reversed(payload["input"]):
+            if (isinstance(item, dict) and item.get("type") == "message"
+                    and item.get("role") == "user"):
+                return _content_to_text(item.get("content"))
+        return ""
+    messages = payload.get("messages") if isinstance(payload, dict) else payload
     if not isinstance(messages, list):
         return ""
     for message in reversed(messages):

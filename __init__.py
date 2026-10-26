@@ -37,7 +37,9 @@ from typing import Any, Optional
 
 from .cortiq_router.classify import classify, classify_detailed
 from .cortiq_router.config import ConfigError, default_config_path, load_config
-from .cortiq_router.execution import ExecutionError, call_endpoint, probe_models, run_probe
+from .cortiq_router.execution import (
+    ExecutionError, call_endpoint, native_text_response, probe_models, responses_to_chat_request, run_probe,
+)
 from .cortiq_router.providers import (
     config_warnings,
     entries_for_provider,
@@ -202,7 +204,8 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
             "tier": selection.get("tier"),
             "model": chosen,
             "originalModel": original or None,
-            "provider": entry.get("provider") if entry.get("direct") else None,
+            "provider": selection.get("actual_provider"),
+            "route_kind": selection.get("route_kind") or "unchanged",
             "fallback": selection.get("fallback", False),
             "status": status,
             "step_continuation": bool(selection.get("step_continuation")),
@@ -287,7 +290,7 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
             _remember_skipped(original, "disabled", fallback=False, at=started_at)
             return None
 
-        text = truncate_text(extract_last_user_text(request.get("messages")),
+        text = truncate_text(extract_last_user_text(request),
                              int(config.get("maxChars", 12000)))
         if not text.strip():
             _remember_skipped(original, "disabled", fallback=False, at=started_at)
@@ -312,25 +315,43 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
             status = metadata.get("status", "ok" if decision else "classifier_error")
             latency = metadata.get("classifier_latency_ms")
 
+        runtime_provider = str(context.get("provider") or "unknown")
         if entry.get("direct"):
-            # Direct calls (also on tool steps) are correlated with llm_execution by
-            # api_request_id; the model is only rewritten when that pairing exists.
+            selection["actual_provider"] = entry.get("provider") or "unknown"
+            selection["route_kind"] = "direct"
+        elif entry.get("native"):
+            selection["actual_provider"] = (entry.get("provider") if entry.get("providerExplicit")
+                                            else runtime_provider)
+            selection["route_kind"] = "native" if selection.get("model") != original else "unchanged"
+        else:
+            selection["actual_provider"] = runtime_provider
+            selection["route_kind"] = "unchanged"
+
+        requires_execution = bool(entry.get("direct") or (entry.get("native") and entry.get("providerExplicit")))
+        if requires_execution:
+            # Endpoint and explicit-native calls are correlated with llm_execution
+            # by api_request_id; the model is only rewritten when that pairing exists.
             request_key = context.get("api_request_id")
             if not request_key:
-                _remember(dict(selection, model=original, entry=None), original,
+                _remember(dict(selection, model=original, entry=None, route_kind="unchanged",
+                               actual_provider=runtime_provider), original,
                           status="no_request_id", classifier_latency_ms=latency, at=started_at)
                 return None
             if not _capability_granted(PROVIDER_CAPABILITY):
                 _warn_capability(PROVIDER_CAPABILITY,
                                  "capability llm.provider_override not granted — direct endpoints skipped. "
                                  "Grant it with `hermes plugins capabilities cortiq-hermes-router`.")
-                _remember(dict(selection, model=original, entry=None), original,
+                _remember(dict(selection, model=original, entry=None, route_kind="unchanged",
+                               actual_provider=runtime_provider), original,
                           status="provider_override_not_granted", classifier_latency_ms=latency,
                           at=started_at)
                 return None
-            _pending_put(str(request_key), {"entry": entry, "originalModel": original})
+            _pending_put(str(request_key), {"entry": entry, "originalModel": original,
+                                             "selection": selection, "status": status,
+                                             "latency": latency, "at": started_at})
 
-        _remember(selection, original, status=status, classifier_latency_ms=latency, at=started_at)
+        if not requires_execution:
+            _remember(selection, original, status=status, classifier_latency_ms=latency, at=started_at)
         chosen = selection.get("model") or ""
         if not chosen or (chosen == original and not entry.get("direct")):
             if config.get("echoRouting"):
@@ -364,10 +385,21 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
 
         entry = record["entry"]
         provider = str(entry.get("provider") or "unknown")
+        selection = dict(record.get("selection") or {})
+        original_model = record.get("originalModel") or request.get("model")
         fallback_request = dict(request)
-        fallback_request["model"] = record.get("originalModel") or request.get("model")
+        fallback_request["model"] = original_model
+
+        def remember_success(updated: Optional[dict] = None) -> None:
+            _remember(updated or selection, str(original_model or ""), status=record.get("status", "ok"),
+                      classifier_latency_ms=record.get("latency"), at=record.get("at", time.time()))
 
         def fall_open(reason: str) -> Any:
+            fallback_selection = dict(selection, model=original_model, fallback=True,
+                                      actual_provider=str(context.get("provider") or "unknown"),
+                                      route_kind="fallback")
+            _remember(fallback_selection, str(original_model or ""), status="execution_fallback",
+                      classifier_latency_ms=record.get("latency"), at=record.get("at", time.time()))
             statistics.record_execution_fallback(provider, reason, at=time.time())
             key = (provider, reason)
             if key not in cache["fallback_warned"]:
@@ -381,12 +413,36 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
         if not _capability_granted(PROVIDER_CAPABILITY):
             return fall_open("provider_override_not_granted")
         try:
-            return call_endpoint(entry, request)
+            if entry.get("native"):
+                if request.get("tools"):
+                    raise ExecutionError("native_tools_unsupported", "native provider override cannot run tool turns")
+                facade = getattr(ctx, "llm", None)
+                complete = getattr(facade, "complete", None)
+                if not callable(complete):
+                    raise ExecutionError("native_unavailable", "Hermes plugin LLM facade is unavailable")
+                native_request = responses_to_chat_request(request) if "input" in request else dict(request)
+                native = complete(
+                    native_request.get("messages") or [], provider=entry["provider"], model=entry["model"],
+                    temperature=native_request.get("temperature"), max_tokens=native_request.get("max_tokens"),
+                    timeout=max(float(entry.get("timeoutMs") or 60000) / 1000.0, 0.001),
+                    purpose="cortiq-router-native-route",
+                )
+                native_selection = dict(selection,
+                                        actual_provider=str(getattr(native, "provider", None) or provider),
+                                        model=str(getattr(native, "model", None) or entry["model"]),
+                                        route_kind="native")
+                reply = native_text_response(text=getattr(native, "text", None), model=getattr(native, "model", None),
+                                             usage=getattr(native, "usage", None), request=request)
+                remember_success(native_selection)
+                return reply
+            reply = call_endpoint(entry, request)
+            remember_success()
+            return reply
         except ExecutionError as exc:
             return fall_open(exc.reason)
         except Exception:  # routing must never break a turn
             logger.debug("cortiq-router: unexpected endpoint error", exc_info=True)
-            return fall_open("internal_error")
+            return fall_open("native_execution_error" if entry.get("native") else "internal_error")
 
     def _status_text() -> str:
         config = _config()

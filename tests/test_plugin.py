@@ -10,6 +10,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from tests.mock_server import MOCK_KEY, MockServer
@@ -54,6 +55,7 @@ class FakeContext:
         self.commands = {}
         self.config = {}
         self.middlewares = {}
+        self.llm: Any = None
 
     def register_middleware(self, kind, callback, **_kwargs):
         self.middlewares.setdefault(kind, []).append(callback)
@@ -69,6 +71,19 @@ class FakeContext:
 
     def set_config(self, key, value):
         self.config[key] = value
+
+
+class FakeNativeLlm:
+    def __init__(self):
+        self.calls = []
+
+    def complete(self, messages, **kwargs):
+        from types import SimpleNamespace
+        self.calls.append({"messages": messages, **kwargs})
+        return SimpleNamespace(
+            text="pong from native", provider=kwargs["provider"], model=kwargs["model"],
+            usage=SimpleNamespace(input_tokens=7, output_tokens=3, total_tokens=10),
+        )
 
 
 class PluginTestCase(unittest.TestCase):
@@ -208,6 +223,90 @@ class DirectExecutionTests(PluginTestCase):
         )
         return result, terminal
 
+    def test_explicit_native_provider_uses_hermes_llm_and_adapts_codex_response(self):
+        native = FakeNativeLlm()
+        self.ctx.llm = native
+        self.write_config({
+            "enabled": True,
+            "globalTiers": {"low": ["gpt-6-luna"], "high": [{
+                "provider": "openai-codex", "model": "gpt-5.6-terra", "native": True,
+            }]},
+            "taskRules": {}, "defaultModel": "gpt-6-luna",
+        })
+        codex = {"model": "gpt-6-luna", "instructions": "be brief", "input": [
+            {"type": "message", "role": "user", "content": "use the configured native provider"}],
+        }
+        result = self.ctx.middlewares["llm_request"][0](
+            codex, api_request_id="native-1", session_id="s1", turn_id="t-native",
+            api_call_count=1, provider="openai-codex", api_mode="codex_responses",
+        )
+        reply, terminal = self._execute(result["request"], request_id="native-1")
+        self.assertEqual(terminal, [])
+        self.assertEqual(reply.status, "completed")
+        self.assertEqual(reply.output[0].content[0].text, "pong from native")
+        self.assertEqual(native.calls[0]["provider"], "openai-codex")
+        self.assertEqual(native.calls[0]["model"], "gpt-5.6-terra")
+        self.assertEqual(native.calls[0]["messages"][0]["content"], "be brief")
+        recent = self.snapshot()["recent"][-1]
+        self.assertEqual(recent["provider"], "openai-codex")
+        self.assertEqual(recent["route_kind"], "native")
+
+    def test_native_tool_request_falls_open_with_stable_reason(self):
+        self.ctx.llm = FakeNativeLlm()
+        self.write_config({
+            "enabled": True,
+            "globalTiers": {"high": [{"provider": "openai-codex", "model": "gpt-5.6-terra", "native": True}]},
+            "taskRules": {}, "defaultModel": "gpt-6-luna",
+        })
+        codex = {"model": "gpt-6-luna", "input": [{
+            "type": "message", "role": "user", "content": "call a tool"}],
+            "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}]}
+        result = self.ctx.middlewares["llm_request"][0](
+            codex, api_request_id="native-tools", session_id="s1", turn_id="t-native-tools",
+            api_call_count=1, provider="openai-codex", api_mode="codex_responses",
+        )
+        reply, terminal = self._execute(result["request"], request_id="native-tools")
+        self.assertEqual(reply, "from-hermes")
+        self.assertEqual(terminal[0]["model"], "gpt-6-luna")
+        self.assertEqual(self.snapshot()["totals"]["fallback_reasons"]["native_tools_unsupported"], 1)
+        self.assertEqual(self.ctx.llm.calls, [])
+
+    def test_codex_responses_high_direct_openrouter_full_path(self):
+        os.environ["OPENROUTER_API_KEY"] = MOCK_KEY
+        self.addCleanup(os.environ.pop, "OPENROUTER_API_KEY", None)
+        self.write_config({
+            "enabled": True,
+            "globalTiers": {
+                "low": ["gpt-6-luna"],
+                "high": [{"provider": "openrouter", "model": "plain-json", "baseUrl": self.server.base_url}],
+            },
+            "taskRules": {}, "defaultModel": "gpt-6-luna",
+        })
+        codex = {
+            "model": "gpt-6-luna", "instructions": "be brief",
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "summarize this"}]}],
+            "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
+        }
+        result = self.ctx.middlewares["llm_request"][0](
+            codex, api_request_id="codex-1", session_id="s1", turn_id="t-codex",
+            api_call_count=1, provider="openai-codex", api_mode="codex_responses",
+        )
+        sent = result["request"]
+        self.assertEqual(sent["model"], "plain-json")
+        reply, terminal = self._execute(sent, request_id="codex-1")
+        self.assertEqual(terminal, [])
+        self.assertEqual(reply.status, "completed")
+        self.assertEqual(reply.output[0].content[0].text, "pong from plain json")
+        upstream = self.server.seen[-1]["body"]
+        self.assertEqual(upstream["model"], "plain-json")
+        self.assertIn("messages", upstream)
+        for incompatible in ("instructions", "input", "reasoning", "max_output_tokens", "prompt_cache_key"):
+            self.assertNotIn(incompatible, upstream)
+        recent = self.snapshot()["recent"][-1]
+        self.assertEqual(recent["provider"], "openrouter")
+        self.assertEqual(recent["route_kind"], "direct")
+
     def test_direct_call_happy_path_returns_the_endpoint_reply(self):
         self._direct_config()
         sent = self.request(api_call_count=1, turn_id="t1")
@@ -228,6 +327,10 @@ class DirectExecutionTests(PluginTestCase):
         self.assertEqual(totals["execution_fallback_count"], 1)
         self.assertEqual(totals["fallback_reasons"]["http_500"], 1)
         self.assertEqual(totals["fallback_by_provider"]["ollama"], 1)
+        recent = self.snapshot()["recent"][-1]
+        self.assertEqual(recent["status"], "execution_fallback")
+        self.assertEqual(recent["route_kind"], "fallback")
+        self.assertEqual(recent["model"], "hermes/model")
 
     def test_timeout_falls_open(self):
         self._direct_config(model="slow", timeoutMs=300)

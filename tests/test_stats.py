@@ -90,6 +90,20 @@ def decision(**overrides):
 
 
 class AggregationTests(unittest.TestCase):
+    def test_route_kind_and_actual_provider_are_aggregated_without_secrets(self):
+        stats = StatsAggregator(MemoryState())
+        stats.record(decision(provider="openai-codex", route_kind="native"), at=AT)
+        stats.record(decision(provider="openrouter", model="moonshotai/kimi-k3.1-pro",
+                              route_kind="direct"), at=AT)
+        stats.record(decision(provider="openai-codex", model="gpt-6-luna", fallback=True,
+                              status="execution_fallback", route_kind="fallback"), at=AT)
+        totals = stats.snapshot()["totals"]
+        self.assertEqual(totals["by_provider"], {"openai-codex": 2, "openrouter": 1})
+        self.assertEqual(totals["by_route_kind"], {"native": 1, "direct": 1, "fallback": 1})
+        recent = stats.recent(1)[0]
+        self.assertEqual(recent["route_kind"], "fallback")
+        self.assertNotIn("mock-test-key", json.dumps(stats.snapshot()))
+
     def test_aggregates_dimensions_averages_latency_and_fallback(self):
         state = MemoryState()
         stats = StatsAggregator(state)
@@ -147,6 +161,24 @@ class PersistenceAndWindowTests(unittest.TestCase):
         self.assertEqual(snapshot["daily"], {})
         self.assertEqual(snapshot["recent"], [])
         self.assertEqual(state.data["last_decision"], {"task": "keep-me"})
+
+    def test_old_aggregate_migrates_route_kind_without_losing_counters(self):
+        legacy = {
+            "version": 1, "timezone": "UTC", "recent": [],
+            "totals": {"calls": 4, "by_tier": {"low": 4}, "by_task": {"qa": 4},
+                       "by_model": {"m": 4}, "by_status": {"ok": 4}, "by_provider": {"openrouter": 4},
+                       "fallback_reasons": {"timeout": 1}, "fallback_by_provider": {"openrouter": 1},
+                       "execution_fallback_count": 1, "step_continuation_count": 0, "fallback_count": 1,
+                       "avg_score": 0.4, "score_count": 4, "avg_classifier_latency_ms": 2.0,
+                       "classifier_latency_count": 4, "max_classifier_latency_ms": 4.0},
+            "daily": {},
+        }
+        snapshot = StatsAggregator(MemoryState({"statistics": legacy})).snapshot()
+        self.assertEqual(snapshot["version"], 2)
+        self.assertEqual(snapshot["totals"]["calls"], 4)
+        self.assertEqual(snapshot["totals"]["by_provider"], {"openrouter": 4})
+        self.assertEqual(snapshot["totals"]["fallback_reasons"], {"timeout": 1})
+        self.assertEqual(snapshot["totals"]["by_route_kind"], {})
 
     def test_old_last_decision_is_migrated_once_without_losing_it(self):
         old = {
@@ -238,6 +270,7 @@ class FormattingTests(unittest.TestCase):
         self.assertIn("By task", output)
         self.assertIn("By model", output)
         self.assertIn("By status", output)
+        self.assertIn("By route kind", output)
         self.assertIn("cheap/model", output)
         self.assertIn("classifier_error", output)
 

@@ -42,6 +42,26 @@ REQUEST = {
     "temperature": 0.2,
 }
 
+CODEX_REQUEST = {
+    "model": "gpt-6-luna",
+    "instructions": "be brief",
+    "input": [
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "ping"}]},
+        {"type": "function_call", "call_id": "call_lookup", "name": "lookup",
+         "arguments": "{\"q\": \"cats\"}"},
+        {"type": "function_call_output", "call_id": "call_lookup", "output": "3 results"},
+        {"type": "message", "role": "user", "content": "summarize"},
+    ],
+    "tools": [{"type": "function", "name": "lookup", "description": "find",
+               "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+               "strict": True}],
+    "tool_choice": {"type": "function", "name": "lookup"},
+    "reasoning": {"effort": "high"},
+    "max_output_tokens": 111,
+    "prompt_cache_key": "session-cache-key",
+}
+
 
 class OpenAIBuilderTests(unittest.TestCase):
     def test_body_uses_entry_model_forces_stream_and_drops_sdk_keys(self):
@@ -61,6 +81,29 @@ class OpenAIBuilderTests(unittest.TestCase):
         entry = endpoint("https://example.test/v1", "gpt-x", apiKeyEnv=KEY_ENV)
         _url, headers, _payload = build_openai_request(entry, REQUEST, MOCK_KEY)
         self.assertEqual(headers["Authorization"], f"Bearer {MOCK_KEY}")
+
+    def test_codex_responses_request_becomes_openai_chat_request(self):
+        entry = endpoint("https://example.test/v1", "moonshotai/kimi-k3.1-pro")
+        _url, _headers, payload = build_openai_request(entry, CODEX_REQUEST, None)
+        body = json.loads(payload)
+        self.assertEqual(body["model"], "moonshotai/kimi-k3.1-pro")
+        self.assertEqual(body["max_tokens"], 111)
+        self.assertTrue(body["stream"])
+        self.assertEqual([message["role"] for message in body["messages"]],
+                         ["system", "user", "assistant", "tool", "user"])
+        self.assertEqual(body["messages"][0]["content"], "be brief")
+        self.assertEqual(body["messages"][1]["content"], "ping")
+        self.assertEqual(body["messages"][2]["tool_calls"][0]["id"], "call_lookup")
+        self.assertEqual(body["messages"][3], {
+            "role": "tool", "tool_call_id": "call_lookup", "content": "3 results"})
+        self.assertEqual(body["tools"][0], {
+            "type": "function", "function": {
+                "name": "lookup", "description": "find", "strict": True,
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+            }})
+        self.assertEqual(body["tool_choice"], {"type": "function", "function": {"name": "lookup"}})
+        for responses_only in ("instructions", "input", "reasoning", "max_output_tokens", "prompt_cache_key"):
+            self.assertNotIn(responses_only, body)
 
     def test_missing_key_env_is_a_fallback_reason_not_a_crash(self):
         entry = endpoint("https://example.test/v1", "gpt-x", apiKeyEnv=KEY_ENV)
@@ -155,6 +198,25 @@ class TransportTests(unittest.TestCase):
         reply = call_endpoint(endpoint(self.server.base_url, "plain-json"), REQUEST, ENV_WITH_KEY)
         self.assertEqual(reply.choices[0].message.content, "pong from plain json")
         self.assertEqual(reply.usage.prompt_tokens, 7)
+
+    def test_codex_direct_reply_is_responses_transport_compatible(self):
+        reply = call_endpoint(endpoint(self.server.base_url, "plain-json"), CODEX_REQUEST, ENV_WITH_KEY)
+        self.assertEqual(reply.status, "completed")
+        self.assertEqual(reply.output[0].type, "message")
+        self.assertEqual(reply.output[0].role, "assistant")
+        self.assertEqual(reply.output[0].content[0].type, "output_text")
+        self.assertEqual(reply.output[0].content[0].text, "pong from plain json")
+        sent = self.server.seen[-1]["body"]
+        self.assertEqual(sent["messages"][0]["role"], "system")
+        self.assertEqual(sent["messages"][-1]["content"], "summarize")
+
+    def test_codex_direct_tool_call_is_responses_compatible(self):
+        reply = call_endpoint(endpoint(self.server.base_url, "tool-call"), CODEX_REQUEST, ENV_WITH_KEY)
+        call = next(item for item in reply.output if item.type == "function_call")
+        self.assertEqual(reply.status, "completed")
+        self.assertEqual(call.call_id, "call_1")
+        self.assertEqual(call.name, "lookup")
+        self.assertEqual(json.loads(call.arguments), {"q": "cats"})
 
     def test_streamed_tool_call_arguments_are_joined(self):
         reply = call_endpoint(endpoint(self.server.base_url, "tool-call"), REQUEST, ENV_WITH_KEY)

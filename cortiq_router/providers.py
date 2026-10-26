@@ -22,7 +22,7 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
     "anthropic": {"baseUrl": "https://api.anthropic.com", "apiKeyEnv": "ANTHROPIC_API_KEY"},
 }
 
-ENTRY_FIELDS = frozenset({"provider", "model", "baseUrl", "apiKeyEnv", "apiMode", "timeoutMs", "extraBody"})
+ENTRY_FIELDS = frozenset({"provider", "model", "native", "baseUrl", "apiKeyEnv", "apiMode", "timeoutMs", "extraBody"})
 API_MODES = frozenset({"chat_completions", "anthropic_messages"})
 DEFAULT_PROVIDER_TIMEOUT_MS = 60000
 
@@ -33,11 +33,17 @@ def is_provider_entry(value: Any) -> bool:
 
 
 def normalize_entry(value: Any) -> dict[str, Any]:
-    """Return a JSON-safe endpoint record; strings retain managed OpenRouter behavior."""
+    """Return a JSON-safe endpoint record; strings use the current Hermes provider."""
     if isinstance(value, str):
         return {
+            # A legacy string stays on the current Hermes provider.  Keep the
+            # historical label for config inspection, but execution/stats use
+            # the runtime provider supplied by Hermes.
             "provider": "openrouter",
+            "providerExplicit": False,
             "model": value,
+            "native": True,
+            "routeKind": "native",
             "baseUrl": None,
             "apiKeyEnv": None,
             "apiMode": "chat_completions",
@@ -48,19 +54,23 @@ def normalize_entry(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("provider entry must be a string or object")
     provider = str(value["provider"]).lower()
+    native = value.get("native") is True
     preset = PROVIDER_PRESETS.get(provider, {})
-    base_url = value.get("baseUrl", preset.get("baseUrl"))
+    base_url = None if native else value.get("baseUrl", preset.get("baseUrl"))
     if isinstance(base_url, str):
         base_url = base_url.rstrip("/")
     return {
         "provider": provider,
+        "providerExplicit": native,
         "model": value["model"],
+        "native": native,
+        "routeKind": "native" if native else "direct",
         "baseUrl": base_url,
-        "apiKeyEnv": value.get("apiKeyEnv", preset.get("apiKeyEnv")),
-        "apiMode": value.get("apiMode", "chat_completions"),
+        "apiKeyEnv": None if native else value.get("apiKeyEnv", preset.get("apiKeyEnv")),
+        "apiMode": "chat_completions" if native else value.get("apiMode", "chat_completions"),
         "timeoutMs": value.get("timeoutMs", DEFAULT_PROVIDER_TIMEOUT_MS),
-        "extraBody": copy.deepcopy(value.get("extraBody") or {}),
-        "direct": True,
+        "extraBody": {} if native else copy.deepcopy(value.get("extraBody") or {}),
+        "direct": not native,
     }
 
 

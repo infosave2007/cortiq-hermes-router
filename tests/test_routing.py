@@ -41,6 +41,17 @@ class ExtractLastUserTextTests(unittest.TestCase):
         self.assertEqual(extract_last_user_text(None), "")
         self.assertEqual(extract_last_user_text("not a list"), "")
 
+    def test_responses_input_uses_last_user_message(self):
+        request = {
+            "instructions": "system",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "first"}]},
+                {"type": "message", "role": "assistant", "content": "answer"},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "last"}]},
+            ],
+        }
+        self.assertEqual(extract_last_user_text(request), "last")
+
     def test_non_string_content_is_empty(self):
         self.assertEqual(extract_last_user_text([{"role": "user", "content": {"x": 1}}]), "")
 

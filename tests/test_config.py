@@ -93,6 +93,21 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             parse_config({"routerUrl": "https://user:pass@router.allaigate.com"})
 
+    def test_codex_native_tiers_with_direct_openrouter_high_parse(self):
+        config = parse_config({
+            "globalTiers": {
+                "low": ["gpt-6-luna"], "medium": ["gpt-5.6-terra"],
+                "high": [{"provider": "openrouter", "model": "moonshotai/kimi-k3.1-pro"}],
+            },
+            "taskRules": {}, "defaultModel": "gpt-6-luna",
+        })
+        high = select_model(config, {"taskLabel": "coding", "complexityScore": 0.9,
+                                     "complexityTier": "high"})["entry"]
+        self.assertTrue(high["direct"])
+        self.assertEqual(high["provider"], "openrouter")
+        self.assertEqual(high["apiKeyEnv"], "OPENROUTER_API_KEY")
+        self.assertEqual(high["model"], "moonshotai/kimi-k3.1-pro")
+
     def test_global_tiers_shape(self):
         cfg = parse_config({"globalTiers": {"low": ["a/b"], "high": ["x/y"]}})
         self.assertEqual(cfg["globalTiers"]["high"], ["x/y"])

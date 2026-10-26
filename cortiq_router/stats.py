@@ -17,13 +17,13 @@ from typing import Any, Mapping, Optional
 logger = logging.getLogger(__name__)
 
 STATE_KEY = "statistics"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 RECENT_LIMIT = 200
 
 
 #: Aggregate keys added in schema 1.1 (v0.3.0). Older state lacks them and is
 #: upgraded in place by :func:`_upgrade_aggregate`; no field is renamed or removed.
-_COUNTER_KEYS = ("by_provider", "fallback_reasons", "fallback_by_provider")
+_COUNTER_KEYS = ("by_provider", "by_route_kind", "fallback_reasons", "fallback_by_provider")
 
 
 def empty_aggregate() -> dict[str, Any]:
@@ -34,6 +34,7 @@ def empty_aggregate() -> dict[str, Any]:
         "by_model": {},
         "by_status": {},
         "by_provider": {},
+        "by_route_kind": {},
         "fallback_reasons": {},
         "fallback_by_provider": {},
         "execution_fallback_count": 0,
@@ -101,6 +102,7 @@ class StatsAggregator:
             if not isinstance(self._data.get("totals"), dict):
                 self._data = _empty_state()
             self._data["totals"] = _upgrade_aggregate(self._data["totals"])
+            self._data["version"] = SCHEMA_VERSION
             if isinstance(self._data.get("daily"), dict):
                 for day, aggregate in self._data["daily"].items():
                     self._data["daily"][day] = _upgrade_aggregate(aggregate)
@@ -156,6 +158,7 @@ class StatsAggregator:
             aggregate["step_continuation_count"] += 1
         if entry.get("provider"):
             cls._increment(aggregate["by_provider"], entry["provider"])
+        cls._increment(aggregate["by_route_kind"], entry.get("route_kind") or "unchanged")
         if entry["fallback"]:
             aggregate["fallback_count"] += 1
 
@@ -193,6 +196,7 @@ class StatsAggregator:
             "status": str(decision.get("status") or "ok"),
             "classifier_latency_ms": _number(decision.get("classifier_latency_ms")),
             "provider": decision.get("provider") or None,
+            "route_kind": str(decision.get("route_kind") or "unchanged"),
             "step_continuation": bool(decision.get("step_continuation", False)),
         }
         day = entry["timestamp"][:10]
@@ -365,6 +369,7 @@ def format_stats(
         ("by_model", "By model"),
         ("by_status", "By status"),
         ("by_provider", "By provider"),
+        ("by_route_kind", "By route kind"),
         ("fallback_reasons", "Execution fallbacks by reason"),
         ("fallback_by_provider", "Execution fallbacks by provider"),
     ):
@@ -389,9 +394,10 @@ def format_recent(entries: list[dict[str, Any]]) -> str:
         _latency(entry["classifier_latency_ms"]),
         entry["originalModel"],
         entry.get("provider") or "-",
+        entry.get("route_kind") or "unchanged",
         "yes" if entry.get("step_continuation") else "no",
     ] for entry in entries]
     return "cortiq-hermes-router recent decisions (newest first, UTC)\n" + _table(
-        ["Timestamp", "Status", "Task", "Score", "Tier", "Model", "Fallback", "Cls ms", "Original model", "Provider", "Tool step"],
+        ["Timestamp", "Status", "Task", "Score", "Tier", "Model", "Fallback", "Cls ms", "Original model", "Provider", "Route", "Tool step"],
         rows,
     )

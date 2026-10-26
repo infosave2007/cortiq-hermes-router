@@ -55,9 +55,10 @@ prompts were routed low → medium → high: `xiaomi/mimo-v2.6-flash`
 - **Classification is bounded**: only the last user message goes to the
   classifier, truncated to `maxChars`, with a `timeoutMs` deadline; repeated
   turns reuse an in-process decision cache.
-- **Provider untouched**: `model.provider`, credentials and `base_url` stay
-  exactly as you configured them — only the `model` id inside the request
-  changes, and only when the classifier answered.
+- **Explicit routing modes**: strings keep Hermes's current provider, `native: true`
+  selects another configured Hermes provider, and endpoint objects perform a direct
+  call with their own key/URL. The schema never silently interprets a provider
+  object as a model string.
 - **Fail-open**: classifier timeout/HTTP error/invalid payload → your
   `defaultModel`; no `defaultModel` → the current model; invalid config → one
   clear warning and routing pauses. The turn never fails because of routing.
@@ -123,14 +124,19 @@ Routing settings live in `~/.config/cortiq-hermes-router/config.json`
 ```json
 {
   "globalTiers": {
-    "low": ["xiaomi/mimo-v2.6-flash"],
-    "medium": ["anthropic/claude-haiku-5.5"],
-    "high": ["moonshotai/kimi-k3.1-pro"]
+    "low": ["gpt-6-luna"],
+    "medium": ["gpt-5.6-terra"],
+    "high": [{ "provider": "openrouter", "model": "moonshotai/kimi-k3.1-pro" }]
   },
   "taskRules": {},
-  "defaultModel": "xiaomi/mimo-v2.6-flash"
+  "defaultModel": "gpt-6-luna"
 }
 ```
+
+This is a safe mixed configuration for an active `openai-codex` / `codex_responses`
+Hermes runtime: low and medium stay on the logged-in ChatGPT/Codex provider, while
+high performs a real OpenRouter request and reads `OPENROUTER_API_KEY` only when it
+executes. Never put that key in this JSON.
 
 Model ids are forwarded unchanged to Hermes' active provider. OpenRouter uses
 `provider/model` ids (for example `anthropic/claude-haiku-5.5`); ChatGPT/Codex
@@ -159,8 +165,23 @@ entries ignored. The classifier decides the tier — decisions are used 1:1.
 
 ## Providers and local models
 
-A tier entry is either a **string** — an OpenRouter model id sent through Hermes'
-own client, exactly as in 0.2.x — or an **object** that names its own endpoint:
+A tier entry has three explicit forms:
+
+1. a **string** — use that model through the current Hermes provider (backward compatible);
+2. a **direct endpoint object** — execute against its own `baseUrl`/provider preset;
+3. a **native provider override** — ask Hermes to resolve another configured provider without a URL:
+
+```json
+{ "provider": "openai-codex", "model": "gpt-6-luna", "native": true }
+```
+
+`native: true` may contain only `provider`, `model`, optional `timeoutMs`, and
+`native`; it cannot contain `baseUrl`, `apiKeyEnv`, `apiMode`, or `extraBody`.
+That strict split prevents a silent provider/endpoint mismatch. Native overrides
+use Hermes's configured credentials and require `llm.provider_override`; direct
+objects read only their declared environment-variable key at call time.
+
+A direct endpoint object names its own endpoint:
 
 ```json
 {
@@ -194,6 +215,7 @@ For `cortiq`, use the id that the server lists at `GET /v1/models`. The
 | Field | Meaning |
 | --- | --- |
 | `provider` | required; a preset name or any label for an explicit `baseUrl` |
+| `native` | optional `true`: resolve this configured Hermes provider; cannot be combined with endpoint/auth fields |
 | `model` | required; the id the endpoint expects (no `provider/` prefix needed for local servers) |
 | `baseUrl` | `http(s)://…/v1`; defaults from the preset; **required** for `vllm`, `llamacpp` and unknown providers |
 | `apiKeyEnv` | **name** of an environment variable holding the key — never the key itself |
@@ -236,8 +258,14 @@ Hermes was going to use, and the reason is counted in statistics:
   reply is assembled before Hermes receives it, so routed direct calls do not show
   live token-by-token output.
 - `anthropic_messages` calls are non-streaming upstream; image content is not converted.
-- Hermes' OpenRouter-only request options (`extra_body`, provider preferences) are not
-  forwarded to direct endpoints; use `extraBody` for what an endpoint needs.
+- With an active `codex_responses` transport, direct Chat Completions and Anthropic
+  requests are translated from `instructions`/`input`/Responses tools and their
+  replies are adapted back to a Responses-compatible `output` object. Unsupported
+  item types fail open as `unsupported_request`; Responses-only fields never reach
+  the direct Chat Completions endpoint.
+- Native provider overrides use Hermes's `ctx.llm` facade for text-only turns.
+  They fail open as `native_tools_unsupported` when the active turn has tools,
+  rather than silently dropping the tool contract.
 - Direct endpoints need the **`llm.provider_override`** capability. It is declared
   at install (consent screen). An install upgraded from 0.2.x must be granted it:
   `hermes plugins capabilities cortiq-hermes-router`. Until then direct entries are
@@ -361,7 +389,7 @@ ok                 131
 ```
 
 `stats today`, `stats week`, or `stats all` selects one period for both the
-summary and all four breakdowns. Recent output is newest first:
+summary and every breakdown. Recent output is newest first:
 
 ```text
 /cortiq-router stats recent 2
@@ -384,6 +412,8 @@ aggregate shape):
   "by_task": {"(none)": 1354, "chitchat": 102, "code": 22, "qa": 7},
   "by_model": {"xiaomi/mimo-v2.6-flash": 1445, "anthropic/claude-haiku-5.5": 29, "moonshotai/kimi-k3.1-pro": 11},
   "by_status": {"step_continuation": 1354, "ok": 131},
+  "by_provider": {"openai-codex": 1445, "openrouter": 40},
+  "by_route_kind": {"native": 1445, "direct": 40},
   "fallback_count": 0,
   "avg_score": 0.418444,
   "score_count": 131,
@@ -407,15 +437,18 @@ Each recent JSON entry has the following fields (shown in full):
   "status": "ok",
   "classifier_latency_ms": 2855.147,
   "provider": null,
+  "route_kind": "native",
   "step_continuation": false
 }
 ```
 
-Tool-loop steps and direct endpoints are visible in the aggregate: `by_provider`
-counts routed decisions per endpoint (`openrouter` for string entries), and
-`execution_fallback_count`, `fallback_reasons` and `fallback_by_provider` count
-direct calls that failed open. `step_continuation_count` counts tool steps that
-skipped classification. Stored statistics from 0.2.x are upgraded in place.
+Tool-loop steps and endpoint outcomes are visible in the aggregate: `by_provider`
+uses the actual selected provider (including the active Hermes provider for
+strings), `by_route_kind` separates `native`, `direct`, `unchanged`, and
+`fallback`, and `execution_fallback_count`, `fallback_reasons`, and
+`fallback_by_provider` count direct/native attempts that fell open. Recent
+records include both provider and route kind. Stored statistics from 0.2.x/0.3.x
+are upgraded in place without discarding counters.
 
 ## Standalone OpenAI-compatible proxy (optional)
 
@@ -451,7 +484,7 @@ process, no `base_url` rewrite.
 ## Tests and validation
 
 ```sh
-python3 -m unittest discover -s tests -t .     # 136 tests: selection, config, providers, HTTP execution, cost control, stats, slash
+python3 -m unittest discover -s tests -t .     # selection, config, mixed providers, HTTP execution, cost control, stats, slash
 cd standalone && npm run check                 # lint + build + 61 unit tests
 hermes plugins validate .                      # catalog gate: probe + security scan
 hermes plugins doctor .                        # real runtime contracts (import + registration)
