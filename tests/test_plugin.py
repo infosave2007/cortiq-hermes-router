@@ -177,13 +177,13 @@ class CostControlTests(PluginTestCase):
             "complexityBands": {"low": 0.45, "medium": 0.6},
         })
         low = self.request(api_call_count=2, turn_id="t-low")
-        self.assertEqual(low["reasoning"], {"enabled": False})
+        self.assertEqual(low["reasoning"], {"effort": "none"})
         with patch.object(self.plugin, "classify_detailed", return_value=(
             {"taskLabel": "qa", "complexityScore": 0.5, "complexityTier": "medium"},
             {"status": "ok", "classifier_latency_ms": 1.0},
         )):
             medium = self.request(api_call_count=1, turn_id="t-medium")
-        self.assertEqual(medium["reasoning"], {"enabled": True, "effort": "high"})
+        self.assertEqual(medium["reasoning"], {"effort": "high"})
 
     def test_new_turn_id_reclassifies(self):
         self.request(api_call_count=1, turn_id="t1")

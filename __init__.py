@@ -358,10 +358,11 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
         new_request = dict(request)
         if chosen:
             new_request["model"] = chosen
-        if effort == "none":
-            new_request["reasoning"] = {"enabled": False}
-        elif effort:
-            new_request["reasoning"] = {"enabled": True, "effort": effort}
+        if effort:
+            # This middleware runs after Hermes has built provider kwargs. The
+            # OpenAI/Codex Responses wire accepts ``reasoning.effort``; it does
+            # not accept Hermes' internal ``enabled`` flag.
+            new_request["reasoning"] = {"effort": effort}
         if new_request == request:
             if config.get("echoRouting"):
                 logger.warning(
