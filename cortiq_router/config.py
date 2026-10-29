@@ -23,8 +23,10 @@ TIERS: tuple[str, ...] = ("low", "medium", "high")
 FIELDS = frozenset({
     "enabled", "apiKeyEnv", "routerUrl", "taxonomyId", "timeoutMs", "maxChars",
     "routerProfile", "complexityBands", "globalTiers", "taskRules",
-    "defaultModel", "echoRouting",
+    "defaultModel", "tierReasoning", "echoRouting",
 })
+
+_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
 
 RESERVED_EXTRA_BODY_KEYS: tuple[str, ...] = ("model", "messages", "stream")
 LOOPBACK_HOSTS: tuple[str, ...] = ("localhost", "127.0.0.1", "::1")
@@ -48,6 +50,7 @@ DEFAULTS: dict[str, Any] = {
     "globalTiers": {},
     "taskRules": {},
     "defaultModel": "",
+    "tierReasoning": {},
     "echoRouting": False,
 }
 
@@ -206,6 +209,14 @@ def parse_config(raw: Any) -> dict:
                 or not isinstance(bands.get("medium"), (int, float)) or isinstance(bands.get("medium"), bool) \
                 or not (0 <= bands["low"] < bands["medium"] <= 1):
             _invalid("complexityBands")
+
+    tier_reasoning = raw.get("tierReasoning")
+    if tier_reasoning is not None:
+        if not _is_object(tier_reasoning):
+            _invalid("tierReasoning")
+        for tier, effort in tier_reasoning.items():
+            if tier not in TIERS or not isinstance(effort, str) or effort not in _REASONING_EFFORTS:
+                _invalid("tierReasoning")
 
     if raw.get("globalTiers") is not None:
         if not _is_object(raw["globalTiers"]):

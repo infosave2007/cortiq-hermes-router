@@ -152,6 +152,7 @@ uses bare ids such as `gpt-6-luna` and `gpt-5.6-terra`.
 | `maxChars` | `12000`; integer 1–1000000 UTF-16 code units |
 | `routerProfile` | `balanced`, `cost-saver`, or `quality-first` |
 | `complexityBands` | Omitted (default): use the router tier. Optional `{ "low": 0.35, "medium": 0.65 }` overrides score thresholds |
+| `tierReasoning` | Empty; optional per-tier effort map such as `{ "low": "none", "medium": "high" }`. Applied to the outgoing request even when tiers use the same model ID. |
 | `globalTiers` | Empty; arrays for `low`, `medium`, `high` of model strings or endpoint objects (see [Providers](#providers-and-local-models)) |
 | `taskRules` | Empty; task label → model string/array or tier object with `low`, `medium`, `high`, `any` (`models` is an alias for `any`) |
 | `defaultModel` | Unset; last candidate and classifier-error fallback |

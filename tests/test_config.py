@@ -32,6 +32,7 @@ class DefaultsTests(unittest.TestCase):
             "globalTiers": {},
             "taskRules": {},
             "defaultModel": "",
+            "tierReasoning": {},
             "echoRouting": False,
         })
 
@@ -125,6 +126,17 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(cfg["globalTiers"]["low"], ["gpt-6-luna"])
         self.assertEqual(cfg["globalTiers"]["medium"], ["gpt-5.6-terra"])
         self.assertEqual(cfg["defaultModel"], "gpt-6-luna")
+
+    def test_tier_reasoning_allows_per_tier_effort_and_rejects_invalid_values(self):
+        cfg = parse_config({"tierReasoning": {"low": "none", "medium": "high", "high": "max"}})
+        self.assertEqual(cfg["tierReasoning"], {"low": "none", "medium": "high", "high": "max"})
+        for bad in (
+            {"tierReasoning": {"other": "high"}},
+            {"tierReasoning": {"low": "invalid"}},
+            {"tierReasoning": []},
+        ):
+            with self.assertRaises(ConfigError):
+                parse_config(bad)
 
     def test_task_rules_shape(self):
         cfg = parse_config({"taskRules": {

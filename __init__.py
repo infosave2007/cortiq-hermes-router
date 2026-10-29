@@ -353,7 +353,16 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
         if not requires_execution:
             _remember(selection, original, status=status, classifier_latency_ms=latency, at=started_at)
         chosen = selection.get("model") or ""
-        if not chosen or (chosen == original and not entry.get("direct")):
+        tier = selection.get("tier")
+        effort = (config.get("tierReasoning") or {}).get(tier)
+        new_request = dict(request)
+        if chosen:
+            new_request["model"] = chosen
+        if effort == "none":
+            new_request["reasoning"] = {"enabled": False}
+        elif effort:
+            new_request["reasoning"] = {"enabled": True, "effort": effort}
+        if new_request == request:
             if config.get("echoRouting"):
                 logger.warning(
                     "cortiq-router: task=%s score=%s tier=%s model=%s (unchanged)%s",
@@ -363,18 +372,17 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
                 )
             return None
 
-        reason = "task={task};score={score};tier={tier};provider={provider};model={model}{cont}".format(
+        reason = "task={task};score={score};tier={tier};provider={provider};model={model}{effort}{cont}".format(
             task=selection.get("task") or ("continuation" if step_continuation else "na"),
             score="na" if selection.get("score") is None else f"{selection['score']:.4f}",
-            tier=selection.get("tier") or "na",
+            tier=tier or "na",
             provider=entry.get("provider") or "hermes",
             model=chosen,
+            effort=(";reasoning=" + effort) if effort else "",
             cont=";step_continuation" if step_continuation else "",
         )
         if config.get("echoRouting"):
             logger.warning("cortiq-router: %s (was %s)", reason, original or "-")
-        new_request = dict(request)
-        new_request["model"] = chosen
         return {"request": new_request, "source": "cortiq-hermes-router", "reason": reason}
 
     def _on_llm_execution(request: Any, next_call: Any, **context: Any) -> Any:
