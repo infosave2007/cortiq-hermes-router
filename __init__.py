@@ -359,10 +359,17 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
         if chosen:
             new_request["model"] = chosen
         if effort:
-            # This middleware runs after Hermes has built provider kwargs. The
-            # OpenAI/Codex Responses wire accepts ``reasoning.effort``; it does
-            # not accept Hermes' internal ``enabled`` flag.
-            new_request["reasoning"] = {"effort": effort}
+            # ``llm_request`` runs after Hermes selected its provider transport.
+            # A Codex Responses payload accepts top-level ``reasoning``; an
+            # OpenAI Chat Completions payload (including OpenRouter) does not.
+            # The latter must keep reasoning in ``extra_body.reasoning`` so the
+            # SDK never receives an unsupported top-level ``reasoning`` kwarg.
+            if context.get("api_mode") == "codex_responses":
+                new_request["reasoning"] = {"effort": effort}
+            else:
+                extra_body = dict(new_request.get("extra_body") or {})
+                extra_body["reasoning"] = {"enabled": effort != "none", "effort": effort}
+                new_request["extra_body"] = extra_body
         if new_request == request:
             if config.get("echoRouting"):
                 logger.warning(
