@@ -157,6 +157,7 @@ uses bare ids such as `gpt-6-luna` and `gpt-5.6-terra`.
 | `taskRules` | Empty; task label → model string/array or tier object with `low`, `medium`, `high`, `any` (`models` is an alias for `any`) |
 | `defaultModel` | Unset; last candidate and classifier-error fallback |
 | `echoRouting` | `false`; log each routing decision (`task=…;score=…;model=…`) |
+| `toolSteps` | `classify`; `low` sends tool-loop steps to the first `globalTiers.low` entry without a classifier call (see [Tool steps](#tool-steps)). The standalone proxy accepts and ignores it. |
 
 Priority for a classified turn: the task's models **for the resolved tier**
 first; at `high` the global `high` chain precedes the task's `any` models
@@ -281,24 +282,36 @@ Hermes was going to use, and the reason is counted in statistics:
 /cortiq-router test <tier|provider>   one prompt, max_tokens=8; runs only when you type it
 ```
 
-## Cost control
+## Tool steps
 
-A user turn can make dozens of provider calls (tool loops). The router classifies
-the turn once and does not re-classify each tool step:
+A user turn is a chain of provider calls: the user's message first, then one
+call per tool-loop step (the model reads the tool output and decides what to do
+next). Every call is classified on the text it has to act on, so the model
+follows the step, not the whole turn:
 
-| Call within a turn (`api_call_count`) | Model choice |
-| --- | --- |
-| `1` (first call) | classify, then tier and `taskRules` as usual |
-| `2` and later (tool-loop continuation) | **no classifier call**; the first `globalTiers.low` entry, or `defaultModel` if `low` is empty; `taskRules` are not consulted |
-| new turn (new `turn_id`) | classify again |
+| Call within a turn (`api_call_count`) | Classified text | Model choice |
+| --- | --- | --- |
+| `1` (first call) | the user's message | tier and `taskRules` as usual |
+| `2` and later (tool-loop step) | the tool outputs of that step: Anthropic `tool_result` blocks, Chat Completions `role: tool` messages or Responses API `function_call_output` items | tier and `taskRules` as usual |
+| new turn (new `turn_id`) | the new message | classify again |
 
-Retries inside the same turn reuse that turn's decision from the cache. When
-`api_call_count` is absent, the call is treated as a first call.
+A hard question therefore runs on a strong model while the step that only has
+to read a directory listing runs on a cheap one, and a stack trace sends the
+next step back to a strong model. A retry of the same step reuses the step's
+decision from the cache (keyed by text and `turn_id`, 10 minutes). When
+`api_call_count` is absent, the call is treated as a first call. A step whose
+tool output has no text (an image only) is left on the current model with
+status `no_text`.
 
-Choose the `low` entry with care: it serves every tool step of long turns. Pick
-the cheapest model that still produces reliable tool calls. Statistics report
-tool steps as `step_continuation_count` (totals and per day), a `Tool step`
-column in `stats recent`, and status `step_continuation`.
+`"toolSteps": "low"` restores the previous behaviour: tool steps make no
+classifier call and go to the first `globalTiers.low` entry (or `defaultModel`
+when `low` is empty; `taskRules` are not consulted), status `step_continuation`.
+Pick the cheapest model that still produces reliable tool calls for that entry.
+
+Statistics count tool steps (any call after the first) as
+`step_continuation_count` (totals and per day) and show them in the `Tool step`
+column of `stats recent`; see "Tokens by model" below for what each model
+actually consumed.
 
 ## Slash command
 
@@ -344,8 +357,10 @@ A v0.1 `last_decision` is migrated once without deleting it; `stats reset yes`
 clears only statistics and also preserves `last_decision`.
 
 Statuses are `ok`, `classifier_error` (HTTP, missing key, or invalid response),
-`classifier_timeout`, `invalid_config`, and `disabled` (routing off, capability
-not granted, or no classifiable request). These are plugin routing decisions,
+`classifier_timeout`, `invalid_config`, `disabled` (routing off or capability
+not granted), `no_text` (nothing to classify: the call carries no text, for
+example a tool output that is only an image) and `step_continuation` (tool
+steps under `toolSteps: "low"`). These are plugin routing decisions,
 not upstream delivery receipts; Hermes's own log may still name the original
 model.
 
@@ -440,6 +455,29 @@ Each recent JSON entry has the following fields (shown in full):
   "provider": null,
   "route_kind": "native",
   "step_continuation": false
+}
+```
+
+`step_continuation` is `true` for every tool step (any call of a turn after the
+first). Token usage is booked separately, per served call and under the model
+that actually served it — Hermes itself books every call under the configured
+model. `stats` prints it as "Tokens by model" (calls, input, output, cache read,
+cache write) for the selected period; `stats --json` carries `usage_by_model` in
+every aggregate plus a `usage_recent` ring buffer of the last 400 calls, one
+entry per call:
+
+```json
+{
+  "timestamp": "2026-11-08T10:12:03.511Z",
+  "model": "claude-opus-5-5",
+  "provider": "anthropic",
+  "session_id": "…",
+  "turn_id": "…",
+  "api_call_count": 3,
+  "input_tokens": 812,
+  "output_tokens": 164,
+  "cache_read_tokens": 21440,
+  "cache_write_tokens": 0
 }
 ```
 

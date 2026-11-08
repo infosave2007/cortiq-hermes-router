@@ -2,15 +2,20 @@
 
 Two middlewares:
 
-* ``llm_request`` classifies the last user message with AllaiGate, selects an
-  endpoint with the cortiq-*-router schema (taskRules -> globalTiers ->
-  defaultModel) and rewrites ``request["model"]``. Classification runs only on
-  the first call of a turn (``api_call_count == 1``); later tool-loop steps skip
-  it and go to the cheapest configured model — see "Cost control" in the README.
+* ``llm_request`` classifies the text the model has to act on — the user's
+  message on the first call of a turn, the tool outputs on every later tool-loop
+  step — with AllaiGate, selects an endpoint with the cortiq-*-router schema
+  (taskRules -> globalTiers -> defaultModel) and rewrites ``request["model"]``.
+  A hard request therefore runs on a strong model while a step that only has to
+  read a directory listing runs on a cheap one. ``toolSteps: "low"`` restores
+  the old behaviour (tool steps go to the first ``globalTiers.low`` entry without
+  a classifier call) — see "Tool steps" in the README.
 * ``llm_execution`` runs object entries (``{"provider", "model", "baseUrl", ...}``)
   against their own endpoint: Ollama, LM Studio, vLLM, llama.cpp, CMF/cortiq or a
   cloud provider. Any failure falls open to the model Hermes was going to use and
-  is counted by reason in the statistics.
+  is counted by reason in the statistics. It also books the token usage of every
+  served call under the model that served it (``stats`` → "Tokens by model"), so
+  spend can be attributed per model even when Hermes books it under one.
 
 String entries keep using Hermes' own OpenRouter client, exactly as before.
 Classifier failures degrade to ``defaultModel`` (and then to the current model);
@@ -48,9 +53,10 @@ from .cortiq_router.providers import (
     normalize_entry,
     unique_provider_entries,
 )
-from .cortiq_router.routing import extract_last_user_text, truncate_text
+from .cortiq_router.routing import extract_step_text, truncate_text
 from .cortiq_router.select import select_model
 from .cortiq_router.stats import StatsAggregator, _table, format_recent, format_stats
+from .cortiq_router.usage import usage_from_response
 
 logger = logging.getLogger(__name__)
 
@@ -82,10 +88,10 @@ _HELP = (
 
 
 def _cheap_selection(config: dict) -> dict[str, Any]:
-    """The tool-loop continuation choice: first ``globalTiers.low`` entry, else ``defaultModel``.
+    """``toolSteps: "low"`` choice for a tool step: first ``globalTiers.low`` entry, else ``defaultModel``.
 
-    Deliberately ignores the classifier and the task rules: a continuation step
-    only needs a model that can keep reading a large tool loop cheaply.
+    Deliberately ignores the classifier and the task rules: in that mode a tool
+    step only needs a model that can keep reading a large tool loop cheaply.
     """
     tiers = config.get("globalTiers") or {}
     values = tiers.get("low") or []
@@ -195,7 +201,7 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
 
     def _remember(selection: dict, original: str, *, status: str,
                   classifier_latency_ms: Optional[float], at: float) -> None:
-        # ``step_continuation`` marks a tool-loop step that skipped classification.
+        # ``step_continuation`` marks a tool-loop step: any call of a turn after the first.
         chosen = selection.get("model") or original or None
         entry = selection.get("entry") or {}
         stored = statistics.record({
@@ -266,6 +272,23 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
         with pending_lock:
             return pending.pop(str(key), None)
 
+    def _book_usage(request: Any, response: Any, context: dict, *, provider: Optional[str] = None) -> None:
+        """Book the served call's token usage under the model that served it; never raises."""
+        try:
+            usage = usage_from_response(response)
+            if usage is None:
+                return
+            usage.update({
+                "model": request.get("model") if isinstance(request, dict) else None,
+                "provider": provider or context.get("provider") or None,
+                "session_id": context.get("session_id") or None,
+                "turn_id": context.get("turn_id") or None,
+                "api_call_count": context.get("api_call_count"),
+            })
+            statistics.record_usage(usage, at=time.time())
+        except Exception as exc:  # bookkeeping must never break a turn
+            logger.debug("cortiq-router: cannot book usage: %s", exc)
+
     def _on_llm_request(request: Any, **context: Any) -> Optional[dict]:
         """llm_request middleware: may replace the outgoing provider kwargs."""
         started_at = time.time()
@@ -290,27 +313,28 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
             _remember_skipped(original, "disabled", fallback=False, at=started_at)
             return None
 
-        text = truncate_text(extract_last_user_text(request),
-                             int(config.get("maxChars", 12000)))
-        if not text.strip():
-            _remember_skipped(original, "disabled", fallback=False, at=started_at)
-            return None
-
-        # Cost control: classify only the first call of a turn; every later tool
-        # step of the same turn is routed to the cheapest configured model.
+        # A turn is a chain of provider calls: the user's message first, then one
+        # call per tool-loop step. Each call is classified on the text it has to
+        # act on (the message, then the tool outputs), so the model follows the
+        # step rather than the whole turn. ``toolSteps: "low"`` instead sends
+        # every tool step to the low tier without a classifier call.
         api_call_count = context.get("api_call_count")
         if not isinstance(api_call_count, int) or isinstance(api_call_count, bool):
             api_call_count = 1
-        step_continuation = api_call_count > 1
-        if step_continuation:
+        tool_step = api_call_count > 1
+        low_mode = tool_step and config.get("toolSteps", "classify") == "low"
+        if low_mode:
             selection = _cheap_selection(config)
             entry = selection.get("entry") or {}
             status, latency = "step_continuation", None
-            decision = None
         else:
+            text = truncate_text(extract_step_text(request), int(config.get("maxChars", 12000)))
+            if not text.strip():
+                _remember_skipped(original, "no_text", fallback=False, at=started_at)
+                return None
             decision, metadata = _classify_cached(text, config, context.get("turn_id"))
             selection = select_model(config, decision)
-            selection["step_continuation"] = False
+            selection["step_continuation"] = tool_step
             entry = selection.get("entry") or {}
             status = metadata.get("status", "ok" if decision else "classifier_error")
             latency = metadata.get("classifier_latency_ms")
@@ -376,18 +400,18 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
                     "cortiq-router: task=%s score=%s tier=%s model=%s (unchanged)%s",
                     selection.get("task"), selection.get("score"),
                     selection.get("tier"), original or "-",
-                    " [tool step]" if step_continuation else "",
+                    " [tool step]" if tool_step else "",
                 )
             return None
 
         reason = "task={task};score={score};tier={tier};provider={provider};model={model}{effort}{cont}".format(
-            task=selection.get("task") or ("continuation" if step_continuation else "na"),
+            task=selection.get("task") or ("continuation" if low_mode else "na"),
             score="na" if selection.get("score") is None else f"{selection['score']:.4f}",
             tier=tier or "na",
             provider=entry.get("provider") or "hermes",
             model=chosen,
             effort=(";reasoning=" + effort) if effort else "",
-            cont=";step_continuation" if step_continuation else "",
+            cont=";step_continuation" if low_mode else (";tool_step" if tool_step else ""),
         )
         if config.get("echoRouting"):
             logger.warning("cortiq-router: %s (was %s)", reason, original or "-")
@@ -397,7 +421,9 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
         """llm_execution middleware: run object entries directly; fail open on any error."""
         record = _pending_take(context.get("api_request_id"))
         if record is None or not isinstance(request, dict):
-            return next_call(request)
+            response = next_call(request)
+            _book_usage(request, response, context)
+            return response
 
         entry = record["entry"]
         provider = str(entry.get("provider") or "unknown")
@@ -424,7 +450,9 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
                                provider, reason)
             else:
                 logger.debug("cortiq-router: %s fell open (%s)", provider, reason)
-            return next_call(fallback_request)
+            response = next_call(fallback_request)
+            _book_usage(fallback_request, response, context)
+            return response
 
         if not _capability_granted(PROVIDER_CAPABILITY):
             return fall_open("provider_override_not_granted")
@@ -450,9 +478,12 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
                 reply = native_text_response(text=getattr(native, "text", None), model=getattr(native, "model", None),
                                              usage=getattr(native, "usage", None), request=request)
                 remember_success(native_selection)
+                _book_usage(dict(request, model=native_selection["model"]), reply, context,
+                            provider=native_selection["actual_provider"])
                 return reply
             reply = call_endpoint(entry, request)
             remember_success()
+            _book_usage(dict(request, model=entry["model"]), reply, context, provider=provider)
             return reply
         except ExecutionError as exc:
             return fall_open(exc.reason)
@@ -478,6 +509,9 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
             f"  key            ${key_name}: "
             f"{'set' if os.environ.get(key_name) else 'MISSING (fallback chain active)'}",
             f"  tiers          {_summarize_tiers(config)}",
+            f"  tool steps     {config.get('toolSteps', 'classify')} — "
+            + ("each step classified on its tool output" if config.get('toolSteps', 'classify') == 'classify'
+               else "first globalTiers.low entry, no classifier call"),
             f"  defaultModel   {_label(config['defaultModel']) if config.get('defaultModel') else '(unset)'}",
             "  endpoints      "
             + (", ".join(providers) if providers else "(none: every entry uses Hermes' OpenRouter client)"),

@@ -117,7 +117,7 @@ class PluginTestCase(unittest.TestCase):
         self.classify_calls.append(text)
         if getattr(self, "fail_classification", False):
             return None, {"status": "classifier_error", "classifier_latency_ms": 1.0}
-        return DECISION, {"status": "ok", "classifier_latency_ms": 2.0}
+        return getattr(self, "decision", DECISION), {"status": "ok", "classifier_latency_ms": 2.0}
 
     def write_config(self, config):
         self.config_path.write_text(json.dumps(config), encoding="utf-8")
@@ -135,8 +135,22 @@ class PluginTestCase(unittest.TestCase):
         return self.ctx.state.get("statistics") or {}
 
 
+LOW_DECISION = {"taskLabel": "qa", "complexityScore": 0.1, "complexityTier": "low"}
+TOOL_OUTPUT = "total 3\ndrwxr-xr-x  deploy\n-rw-r--r--  README.md"
+
+
+def anthropic_tool_step(output=TOOL_OUTPUT):
+    """Hermes' Anthropic-mode payload of a tool step: the tool results sit in a user message."""
+    return [
+        {"role": "user", "content": "fix the deploy script"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "terminal",
+                                           "input": {"command": "ls"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": output}]},
+    ]
+
+
 class CostControlTests(PluginTestCase):
-    """Item A: one classified decision per turn, cheap model for tool-loop steps."""
+    """Item A: every call of a turn is classified on its own text; a tool step follows its tool output."""
 
     def test_first_call_is_classified_and_uses_the_expensive_tier(self):
         sent = self.request(api_call_count=1, turn_id="t1")
@@ -146,12 +160,69 @@ class CostControlTests(PluginTestCase):
         self.assertEqual(stats["by_status"]["ok"], 1)
         self.assertEqual(stats["step_continuation_count"], 0)
 
-    def test_tool_loop_steps_skip_classification_and_use_the_low_tier(self):
+    def test_tool_steps_are_classified_on_their_tool_output(self):
+        sent = self.request(api_call_count=1, turn_id="t1",
+                            messages=[{"role": "user", "content": "fix the deploy script"}])
+        self.assertEqual(sent["model"], "strong/big")
+        self.decision = LOW_DECISION
+        sent = self.request(api_call_count=2, turn_id="t1", messages=anthropic_tool_step())
+        self.assertEqual(sent["model"], "cheap/mini", "a simple tool output goes to the low tier")
+        self.assertEqual(self.classify_calls[-1], TOOL_OUTPUT, "the step is classified on the tool output")
+        self.decision = DECISION
+        sent = self.request(api_call_count=3, turn_id="t1",
+                            messages=anthropic_tool_step("Traceback (most recent call last): ..."))
+        self.assertEqual(sent["model"], "strong/big", "a hard tool output goes back to the high tier")
+        self.assertEqual(len(self.classify_calls), 3, "one classifier call per distinct step")
+        stats = self.snapshot()["totals"]
+        self.assertEqual(stats["calls"], 3)
+        self.assertEqual(stats["by_status"], {"ok": 3})
+        self.assertEqual(stats["step_continuation_count"], 2, "tool steps are still counted as such")
+        recent = self.snapshot()["recent"]
+        self.assertEqual([e["step_continuation"] for e in recent], [False, True, True])
+        self.assertEqual([e["task"] for e in recent], ["coding", "qa", "coding"])
+
+    def test_openai_tool_messages_are_the_step_text(self):
+        self.decision = LOW_DECISION
+        sent = self.request(api_call_count=2, turn_id="t1", messages=[
+            {"role": "user", "content": "fix the deploy script"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function",
+                                                                    "function": {"name": "ls", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "first output"},
+            {"role": "tool", "tool_call_id": "c2", "content": "second output"},
+        ])
+        self.assertEqual(sent["model"], "cheap/mini")
+        self.assertEqual(self.classify_calls, ["first output\nsecond output"])
+
+    def test_retry_of_the_same_step_reuses_the_cached_decision(self):
+        self.request(api_call_count=2, turn_id="t1", messages=anthropic_tool_step())
+        sent = self.request(api_call_count=2, turn_id="t1", messages=anthropic_tool_step())
+        self.assertEqual(sent["model"], "strong/big")
+        self.assertEqual(len(self.classify_calls), 1)
+        self.request(api_call_count=2, turn_id="t2", messages=anthropic_tool_step())
+        self.assertEqual(len(self.classify_calls), 2, "another turn classifies again")
+
+    def test_step_without_any_text_is_left_on_the_original_model(self):
+        payload = {"model": "hermes/model", "messages": anthropic_tool_step(
+            [{"type": "image", "source": {"type": "base64", "data": "..."}}])}
+        result = self.ctx.middlewares["llm_request"][0](payload, api_call_count=2, turn_id="t1",
+                                                        session_id="s1", api_request_id="req-2")
+        self.assertIsNone(result)
+        self.assertEqual(self.classify_calls, [])
+        recent = self.snapshot()["recent"][-1]
+        self.assertEqual((recent["status"], recent["model"], recent["task"]),
+                         ("no_text", "hermes/model", "unclassified"))
+
+    def test_low_mode_sends_tool_steps_to_the_low_tier_without_classifying(self):
+        self.write_config({
+            "enabled": True, "toolSteps": "low",
+            "globalTiers": {"low": ["cheap/mini"], "high": ["strong/big"]},
+            "taskRules": {}, "defaultModel": "fallback/model",
+        })
         self.request(api_call_count=1, turn_id="t1")
         for step in (2, 3, 4):
-            sent = self.request(api_call_count=step, turn_id="t1")
+            sent = self.request(api_call_count=step, turn_id="t1", messages=anthropic_tool_step())
             self.assertEqual(sent["model"], "cheap/mini")
-        self.assertEqual(len(self.classify_calls), 1, "classifier must not run per tool step")
+        self.assertEqual(len(self.classify_calls), 1, "classifier must not run per tool step in low mode")
         stats = self.snapshot()["totals"]
         self.assertEqual(stats["calls"], 4)
         self.assertEqual(stats["step_continuation_count"], 3)
@@ -159,8 +230,8 @@ class CostControlTests(PluginTestCase):
         self.assertEqual(stats["by_status"]["ok"], 1)
         self.assertAlmostEqual(stats.get("avg_score"), DECISION["complexityScore"])
 
-    def test_continuation_falls_back_to_default_model_when_low_tier_is_empty(self):
-        self.write_config({"enabled": True, "globalTiers": {}, "taskRules": {},
+    def test_low_mode_falls_back_to_default_model_when_low_tier_is_empty(self):
+        self.write_config({"enabled": True, "toolSteps": "low", "globalTiers": {}, "taskRules": {},
                            "defaultModel": "fallback/model"})
         sent = self.request(api_call_count=7, turn_id="t2")
         self.assertEqual(sent["model"], "fallback/model")
@@ -175,6 +246,7 @@ class CostControlTests(PluginTestCase):
             "tierReasoning": {"low": "none", "medium": "high"},
             "taskRules": {}, "defaultModel": "gpt-5.6-terra",
             "complexityBands": {"low": 0.45, "medium": 0.6},
+            "toolSteps": "low",
         })
         low = self.request(api_call_count=2, turn_id="t-low", api_mode="chat_completions")
         self.assertNotIn("reasoning", low)
@@ -193,6 +265,7 @@ class CostControlTests(PluginTestCase):
             "globalTiers": {"low": ["gpt-5.6-terra"]},
             "tierReasoning": {"low": "none"},
             "taskRules": {}, "defaultModel": "gpt-5.6-terra",
+            "toolSteps": "low",
         })
         low = self.request(api_call_count=2, turn_id="t-low", api_mode="codex_responses")
         self.assertEqual(low["reasoning"], {"effort": "none"})
@@ -217,6 +290,7 @@ class CostControlTests(PluginTestCase):
                                      "baseUrl": self.server.base_url}]},
             "taskRules": {},
             "defaultModel": "fallback/model",
+            "toolSteps": "low",
         })
         sent = self.request(api_call_count=2, turn_id="t3")
         self.assertEqual(sent["model"], "plain-json", "tool step uses the cheap direct endpoint")
@@ -224,7 +298,7 @@ class CostControlTests(PluginTestCase):
         result = execution(sent, lambda payload: "terminal", api_request_id="req-1")
         self.assertEqual(result.choices[0].message.content, "pong from plain json")
         self.assertEqual(sum(1 for item in self.server.seen if item["method"] == "POST"), 1)
-        self.assertEqual(len(self.classify_calls), 0, "tool steps never classify")
+        self.assertEqual(len(self.classify_calls), 0, "tool steps never classify in low mode")
 
     def test_missing_api_call_count_behaves_like_the_first_call(self):
         payload = {"model": "hermes/model", "messages": [{"role": "user", "content": "hi"}]}
@@ -232,6 +306,50 @@ class CostControlTests(PluginTestCase):
             payload, api_request_id="req-x", session_id="s1")
         self.assertEqual(result["request"]["model"], "strong/big")
         self.assertEqual(len(self.classify_calls), 1)
+
+
+class UsageBookkeepingTests(PluginTestCase):
+    """llm_execution books each served call's tokens under the model that served it."""
+
+    def _execute(self, sent, response, **context):
+        context.setdefault("api_request_id", "req-1")
+        context.setdefault("session_id", "s1")
+        context.setdefault("turn_id", "t1")
+        context.setdefault("provider", "anthropic")
+        execution = self.ctx.middlewares["llm_execution"][0]
+        return execution(sent, lambda payload: response, **context)
+
+    def test_anthropic_usage_is_booked_under_the_routed_model(self):
+        from types import SimpleNamespace
+        sent = self.request(api_call_count=1, turn_id="t1")
+        self.assertEqual(sent["model"], "strong/big")
+        response = SimpleNamespace(usage=SimpleNamespace(
+            input_tokens=100, output_tokens=20, cache_read_input_tokens=300, cache_creation_input_tokens=5))
+        self.assertIs(self._execute(sent, response, api_call_count=1), response)
+        entry = self.snapshot()["usage_recent"][-1]
+        self.assertEqual((entry["model"], entry["provider"], entry["session_id"], entry["turn_id"], entry["api_call_count"]),
+                         ("strong/big", "anthropic", "s1", "t1", 1))
+        self.assertEqual((entry["input_tokens"], entry["output_tokens"], entry["cache_read_tokens"],
+                          entry["cache_write_tokens"]), (100, 20, 300, 5))
+        totals = self.snapshot()["totals"]["usage_by_model"]["strong/big"]
+        self.assertEqual(totals["calls"], 1)
+        self.assertEqual(totals["cache_read_tokens"], 300)
+        self.assertIn("Tokens by model", self.handler("stats all"))
+
+    def test_openai_usage_and_unrouted_calls_are_booked_too(self):
+        payload = {"model": "hermes/model", "messages": [{"role": "user", "content": "hi"}]}
+        response = {"choices": [], "usage": {"prompt_tokens": 120, "completion_tokens": 8,
+                                            "prompt_tokens_details": {"cached_tokens": 100}}}
+        self.assertIs(self._execute(payload, response, api_request_id="req-9"), response)
+        entry = self.snapshot()["usage_recent"][-1]
+        self.assertEqual(entry["model"], "hermes/model")
+        self.assertEqual((entry["input_tokens"], entry["output_tokens"], entry["cache_read_tokens"]), (20, 8, 100))
+
+    def test_responses_without_usage_are_passed_through_untouched(self):
+        payload = {"model": "hermes/model", "messages": [{"role": "user", "content": "hi"}]}
+        for response in ("a string", None, object(), {"choices": []}):
+            self.assertIs(self._execute(payload, response, api_request_id="req-x"), response)
+        self.assertEqual(self.snapshot().get("usage_recent", []), [])
 
 
 class DirectExecutionTests(PluginTestCase):

@@ -2,6 +2,11 @@
 
 Only decision metadata is accepted into the recent buffer; request/response text
 is never part of the schema. Daily buckets use UTC calendar days.
+
+Token usage is booked per served call under the model that served it
+(``usage_by_model`` in every aggregate, ``usage_recent`` ring buffer): model,
+provider, session/turn ids, the call's position in the turn and four token
+counts — nothing else.
 """
 
 from __future__ import annotations
@@ -19,6 +24,8 @@ logger = logging.getLogger(__name__)
 STATE_KEY = "statistics"
 SCHEMA_VERSION = 2
 RECENT_LIMIT = 200
+USAGE_RECENT_LIMIT = 400
+USAGE_FIELDS: tuple[str, ...] = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
 
 
 #: Aggregate keys added in schema 1.1 (v0.3.0). Older state lacks them and is
@@ -45,7 +52,12 @@ def empty_aggregate() -> dict[str, Any]:
         "avg_classifier_latency_ms": None,
         "classifier_latency_count": 0,
         "max_classifier_latency_ms": None,
+        "usage_by_model": {},
     }
+
+
+def _usage_bucket() -> dict[str, int]:
+    return {"calls": 0, **{field: 0 for field in USAGE_FIELDS}}
 
 
 def _empty_state() -> dict[str, Any]:
@@ -55,6 +67,7 @@ def _empty_state() -> dict[str, Any]:
         "totals": empty_aggregate(),
         "daily": {},
         "recent": [],
+        "usage_recent": [],
     }
 
 
@@ -108,6 +121,8 @@ class StatsAggregator:
                     self._data["daily"][day] = _upgrade_aggregate(aggregate)
             else:
                 self._data["daily"] = {}
+            if not isinstance(self._data.get("usage_recent"), list):
+                self._data["usage_recent"] = []
             if stored is None:
                 self._migrate_last_decision()
 
@@ -210,6 +225,41 @@ class StatsAggregator:
             self._persist()
             return copy.deepcopy(entry)
 
+    def record_usage(self, usage: Mapping[str, Any], *, at: Optional[float] = None) -> dict[str, Any]:
+        """Book the token usage of one served call under the model that served it.
+
+        Only identifiers and counts are stored: model, provider, session/turn ids,
+        ``api_call_count`` (the call's position in the turn) and the four token
+        buckets of :mod:`cortiq_router.usage`.
+        """
+        stamp = time.time() if at is None else float(at)
+        model = str(usage.get("model") or "(unknown)")
+        position = usage.get("api_call_count")
+        entry: dict[str, Any] = {
+            "timestamp": utc_timestamp(stamp),
+            "model": model,
+            "provider": str(usage["provider"]) if usage.get("provider") else None,
+            "session_id": str(usage["session_id"]) if usage.get("session_id") else None,
+            "turn_id": str(usage["turn_id"]) if usage.get("turn_id") else None,
+            "api_call_count": position if isinstance(position, int) and not isinstance(position, bool) else None,
+        }
+        for field in USAGE_FIELDS:
+            value = usage.get(field)
+            entry[field] = int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0 else 0
+        day = entry["timestamp"][:10]
+        with self._lock:
+            for aggregate in (self._data["totals"], self._data["daily"].setdefault(day, empty_aggregate())):
+                bucket = _upgrade_aggregate(aggregate)["usage_by_model"].setdefault(model, _usage_bucket())
+                bucket["calls"] += 1
+                for field in USAGE_FIELDS:
+                    bucket[field] += entry[field]
+            recent = self._data.setdefault("usage_recent", [])
+            recent.append(entry)
+            if len(recent) > USAGE_RECENT_LIMIT:
+                del recent[:-USAGE_RECENT_LIMIT]
+            self._persist()
+            return copy.deepcopy(entry)
+
     def record_execution_fallback(self, provider: Optional[str], reason: str, *,
                                   at: Optional[float] = None) -> None:
         """Count one failed direct call that fell open to the Hermes model.
@@ -243,6 +293,10 @@ class StatsAggregator:
             for name in ("by_tier", "by_task", "by_model", "by_status", *_COUNTER_KEYS):
                 for key, count in aggregate[name].items():
                     combined[name][key] = combined[name].get(key, 0) + count
+            for model, bucket in (aggregate.get("usage_by_model") or {}).items():
+                target = combined["usage_by_model"].setdefault(model, _usage_bucket())
+                for key in ("calls", *USAGE_FIELDS):
+                    target[key] += int(bucket.get(key, 0) or 0)
             score_count = aggregate["score_count"]
             if score_count:
                 score_sum += aggregate["avg_score"] * score_count
@@ -376,6 +430,14 @@ def format_stats(
         values = _upgrade_aggregate(aggregate).get(key) or {}
         if values:
             lines.append(_breakdown(f"{labels[selected]} · {title}", values))
+    usage = _upgrade_aggregate(aggregate).get("usage_by_model") or {}
+    if usage:
+        rows = [[model, bucket.get("calls", 0), *(bucket.get(field, 0) for field in USAGE_FIELDS)]
+                for model, bucket in sorted(
+                    usage.items(),
+                    key=lambda item: (-(item[1].get("input_tokens", 0) + item[1].get("output_tokens", 0)), item[0]))]
+        lines.append(f"{labels[selected]} · Tokens by model (served calls)\n" + _table(
+            ["Model", "Calls", "Input", "Output", "Cache read", "Cache write"], rows))
     return "\n\n".join(lines)
 
 

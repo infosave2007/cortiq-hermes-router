@@ -34,6 +34,7 @@ class DefaultsTests(unittest.TestCase):
             "defaultModel": "",
             "tierReasoning": {},
             "echoRouting": False,
+            "toolSteps": "classify",
         })
 
     def test_empty_object_equals_defaults(self):
@@ -60,6 +61,15 @@ class ValidationTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 parse_config({"maxChars": bad})
         self.assertEqual(parse_config({"maxChars": 1})["maxChars"], 1)
+
+    def test_tool_steps_enum(self):
+        self.assertEqual(parse_config({"toolSteps": "low"})["toolSteps"], "low")
+        self.assertEqual(parse_config({"toolSteps": "classify"})["toolSteps"], "classify")
+        for bad in ("turn", "", 1, True, None):
+            if bad is None:
+                continue
+            with self.subTest(bad=bad), self.assertRaisesRegex(ConfigError, "toolSteps"):
+                parse_config({"toolSteps": bad})
 
     def test_router_profile_enum(self):
         self.assertEqual(parse_config({"routerProfile": "cost-saver"})["routerProfile"], "cost-saver")

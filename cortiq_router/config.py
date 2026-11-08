@@ -23,8 +23,11 @@ TIERS: tuple[str, ...] = ("low", "medium", "high")
 FIELDS = frozenset({
     "enabled", "apiKeyEnv", "routerUrl", "taxonomyId", "timeoutMs", "maxChars",
     "routerProfile", "complexityBands", "globalTiers", "taskRules",
-    "defaultModel", "tierReasoning", "echoRouting",
+    "defaultModel", "tierReasoning", "echoRouting", "toolSteps",
 })
+
+#: How the calls after the first one of a turn (tool-loop steps) pick a model.
+TOOL_STEP_MODES: tuple[str, ...] = ("classify", "low")
 
 _REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
 
@@ -52,6 +55,7 @@ DEFAULTS: dict[str, Any] = {
     "defaultModel": "",
     "tierReasoning": {},
     "echoRouting": False,
+    "toolSteps": "classify",
 }
 
 
@@ -197,6 +201,9 @@ def parse_config(raw: Any) -> dict:
     profile = raw.get("routerProfile")
     if profile is not None and (not isinstance(profile, str) or profile not in PROFILES):
         _invalid("routerProfile")
+    tool_steps = raw.get("toolSteps")
+    if tool_steps is not None and (not isinstance(tool_steps, str) or tool_steps not in TOOL_STEP_MODES):
+        _invalid("toolSteps")
 
     router_url = "https://router.allaigate.com"
     if raw.get("routerUrl") is not None:

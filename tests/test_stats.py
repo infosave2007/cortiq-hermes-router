@@ -386,8 +386,14 @@ class PluginStatsCommandTests(unittest.TestCase):
              (None, {"status": "classifier_timeout", "classifier_latency_ms": 50.0}),
              True, request, "fallback/model", True),
             ("disabled", self.CONFIG, None, False, request, "original/model", False),
-            ("disabled", self.CONFIG, None, True,
+            ("no_text", self.CONFIG, None, True,
              {"model": "original/model", "messages": []}, "original/model", False),
+            ("no_text", self.CONFIG, None, True,
+             {"model": "original/model", "messages": [
+                 {"role": "user", "content": "do it"},
+                 {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1",
+                                               "content": [{"type": "image", "source": {}}]}]}]},
+             "original/model", False),
             ("disabled", self.CONFIG, None, True, None, None, False),
         ]
         for expected_status, config, classified, capability, incoming, model, fallback in cases:
@@ -408,10 +414,86 @@ class PluginStatsCommandTests(unittest.TestCase):
                 self.assertEqual(entry["model"], model)
                 self.assertEqual(entry["fallback"], fallback)
                 self.assertEqual(entry["originalModel"], "original/model" if isinstance(incoming, dict) else None)
-                if expected_status in ("disabled", "invalid_config"):
+                if expected_status in ("disabled", "invalid_config", "no_text"):
                     detailed.assert_not_called()
                 if expected_status == "classifier_timeout":
                     self.assertEqual(entry["classifier_latency_ms"], 50.0)
+
+
+class UsageStatsTests(unittest.TestCase):
+    """Token usage is booked per served call under the model that served it."""
+
+    USAGE = {"model": "strong/big", "provider": "anthropic", "session_id": "s1", "turn_id": "t1",
+             "api_call_count": 2, "input_tokens": 100, "output_tokens": 20,
+             "cache_read_tokens": 300, "cache_write_tokens": 5}
+
+    def test_record_usage_aggregates_totals_daily_and_recent(self):
+        state = MemoryState()
+        stats = StatsAggregator(state)
+        entry = stats.record_usage(self.USAGE, at=AT)
+        stats.record_usage(dict(self.USAGE, model="cheap/mini", output_tokens=7, api_call_count=3), at=AT + 60)
+        stats.record_usage(dict(self.USAGE, input_tokens=1), at=AT + 86400)
+        self.assertEqual(entry["timestamp"], "2026-10-25T12:00:00.000Z")
+        self.assertEqual(entry["model"], "strong/big")
+        self.assertEqual(entry["session_id"], "s1")
+        self.assertEqual(entry["api_call_count"], 2)
+        self.assertNotIn("text", json.dumps(entry))
+        snapshot = stats.snapshot()
+        self.assertEqual(snapshot["totals"]["usage_by_model"]["strong/big"],
+                         {"calls": 2, "input_tokens": 101, "output_tokens": 40, "cache_read_tokens": 600,
+                          "cache_write_tokens": 10})
+        self.assertEqual(snapshot["totals"]["usage_by_model"]["cheap/mini"]["output_tokens"], 7)
+        self.assertEqual(snapshot["daily"]["2026-10-25"]["usage_by_model"]["strong/big"]["calls"], 1)
+        self.assertEqual(snapshot["daily"]["2026-10-26"]["usage_by_model"]["strong/big"]["input_tokens"], 1)
+        self.assertEqual([e["model"] for e in snapshot["usage_recent"]], ["strong/big", "cheap/mini", "strong/big"])
+        self.assertEqual(state.data["statistics"]["usage_recent"][1]["output_tokens"], 7)
+        # decisions are untouched by usage bookkeeping
+        self.assertEqual(snapshot["totals"]["calls"], 0)
+        self.assertEqual(snapshot["recent"], [])
+
+    def test_week_combines_usage_and_old_state_is_upgraded(self):
+        state = MemoryState({"statistics": {
+            "version": 2, "timezone": "UTC",
+            "totals": {"calls": 1, "by_tier": {}, "by_task": {}, "by_model": {}, "by_status": {"ok": 1},
+                       "fallback_count": 0, "avg_score": None, "score_count": 0,
+                       "avg_classifier_latency_ms": None, "classifier_latency_count": 0,
+                       "max_classifier_latency_ms": None},
+            "daily": {}, "recent": [],
+        }})
+        stats = StatsAggregator(state)
+        self.assertEqual(stats.snapshot()["totals"]["usage_by_model"], {})
+        self.assertEqual(stats.snapshot()["usage_recent"], [])
+        stats.record_usage(self.USAGE, at=AT)
+        stats.record_usage(dict(self.USAGE, output_tokens=2), at=AT - 3 * 86400)
+        stats.record_usage(dict(self.USAGE, output_tokens=1000), at=AT - 8 * 86400)
+        week = stats.aggregate("week", now=AT)
+        self.assertEqual(week["usage_by_model"]["strong/big"]["calls"], 2)
+        self.assertEqual(week["usage_by_model"]["strong/big"]["output_tokens"], 22)
+        self.assertEqual(stats.aggregate("today", now=AT)["usage_by_model"]["strong/big"]["output_tokens"], 20)
+
+    def test_usage_recent_is_bounded_and_counts_are_sanitized(self):
+        stats = StatsAggregator(MemoryState())
+        for index in range(stats_module.USAGE_RECENT_LIMIT + 5):
+            stats.record_usage(dict(self.USAGE, output_tokens=index), at=AT + index)
+        recent = stats.snapshot()["usage_recent"]
+        self.assertEqual(len(recent), stats_module.USAGE_RECENT_LIMIT)
+        self.assertEqual(recent[-1]["output_tokens"], stats_module.USAGE_RECENT_LIMIT + 4)
+        entry = stats.record_usage({"model": None, "input_tokens": -4, "output_tokens": "9",
+                                    "cache_read_tokens": True, "api_call_count": True}, at=AT)
+        self.assertEqual(entry["model"], "(unknown)")
+        self.assertEqual((entry["input_tokens"], entry["output_tokens"], entry["cache_read_tokens"]), (0, 0, 0))
+        self.assertIsNone(entry["api_call_count"])
+        self.assertIsNone(entry["session_id"])
+
+    def test_format_stats_shows_tokens_by_model(self):
+        stats = StatsAggregator(MemoryState())
+        stats.record({"task": "code", "score": 0.9, "tier": "high", "model": "strong/big",
+                      "originalModel": "o", "fallback": False, "status": "ok", "classifier_latency_ms": 1.0}, at=AT)
+        stats.record_usage(self.USAGE, at=AT)
+        text = stats_module.format_stats(stats, "all", now=AT)
+        self.assertIn("Tokens by model", text)
+        self.assertIn("strong/big", text.split("Tokens by model")[1])
+        self.assertIn("Cache read", text)
 
 
 if __name__ == "__main__":

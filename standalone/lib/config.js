@@ -15,7 +15,7 @@ import { join, resolve } from 'node:path';
 const CONFIG_FIELDS = new Set([
   'enabled', 'apiKeyEnv', 'routerUrl', 'taxonomyId', 'timeoutMs', 'maxChars',
   'routerProfile', 'complexityBands', 'globalTiers', 'taskRules',
-  'defaultModel', 'echoRouting', 'host', 'port', 'upstream',
+  'defaultModel', 'echoRouting', 'toolSteps', 'host', 'port', 'upstream',
 ]);
 const UPSTREAM_FIELDS = new Set(['url', 'apiKeyEnv', 'timeoutMs']);
 const TIER_NAMES = ['low', 'medium', 'high'];
