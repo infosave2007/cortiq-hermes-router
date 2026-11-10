@@ -109,8 +109,9 @@ chat session — do not run them from chat.
 
 ## Configure
 
-Get a free AllaiGate API key at [api.allaigate.com](https://api.allaigate.com/)
-(the router's classifier key, separate from any model-provider keys). Put it
+Get a free AllaiGate API key at [api.allaigate.com](https://api.allaigate.com/):
+enter your email and the promo code `LAUNCH1`, and the key arrives by email.
+It is the router's classifier key, separate from any model-provider keys. Put it
 in your Hermes profile's `.env` (never in this repository). Every key is read
 through Hermes's secret API, so each profile uses its own keys:
 
