@@ -111,7 +111,8 @@ chat session — do not run them from chat.
 
 Get a free AllaiGate API key at [api.allaigate.com](https://api.allaigate.com/)
 (the router's classifier key, separate from any model-provider keys). Put it
-in the environment that starts Hermes (never in this repository):
+in your Hermes profile's `.env` (never in this repository). Every key is read
+through Hermes's secret API, so each profile uses its own keys:
 
 ```sh
 echo 'CORTIQ_ROUTER_KEY=your-allaigate-key' >> ~/.hermes/.env
@@ -220,7 +221,7 @@ For `cortiq`, use the id that the server lists at `GET /v1/models`. The
 | `native` | optional `true`: resolve this configured Hermes provider; cannot be combined with endpoint/auth fields |
 | `model` | required; the id the endpoint expects (no `provider/` prefix needed for local servers) |
 | `baseUrl` | `http(s)://…/v1`; defaults from the preset; **required** for `vllm`, `llamacpp` and unknown providers |
-| `apiKeyEnv` | **name** of an environment variable holding the key — never the key itself |
+| `apiKeyEnv` | **name** of the variable holding the key — never the key itself; resolved for the active Hermes profile through its secret API |
 | `apiMode` | `chat_completions` (default) or `anthropic_messages` |
 | `timeoutMs` | default `60000`; maximum silence allowed between bytes, 1–120000 |
 | `extraBody` | object merged into the request body; cannot set `model`, `messages` or `stream` |

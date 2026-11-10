@@ -3,8 +3,10 @@
 Only object entries (``{"provider", "model", ...}``) are executed here. String
 entries keep going through Hermes' own OpenRouter client, unchanged.
 
-Credentials: the value of the environment variable named by ``apiKeyEnv`` is read
-at call time, placed in the request header and never stored, logged or returned.
+Credentials: the secret named by ``apiKeyEnv`` is read at call time through
+Hermes's profile-scoped secret API (``agent.secret_scope.get_secret``), placed in
+the request header and never stored, logged or returned. A key is never attached
+to a plain ``http://`` URL whose host is not loopback.
 Every failure is raised as :class:`ExecutionError` with a short machine reason
 (``timeout``, ``connection``, ``http_500``, ``invalid_json``, ...) so the caller
 can fail open and record the reason in statistics.
@@ -14,12 +16,13 @@ from __future__ import annotations
 
 import copy
 import json
-import os
 import socket
 import urllib.error
 import urllib.request
 from types import SimpleNamespace
 from typing import Any, Mapping, Optional
+
+from .credentials import SECRETS, cleartext_to_remote
 
 ANTHROPIC_VERSION = "2023-06-01"
 ANTHROPIC_DEFAULT_MAX_TOKENS = 4096
@@ -117,11 +120,17 @@ def _tool_call(raw: Mapping[str, Any]) -> SimpleNamespace:
 # --------------------------------------------------------------------------- #
 
 def resolve_api_key(entry: Mapping[str, Any], env: Optional[Mapping[str, str]] = None) -> Optional[str]:
-    """Return the key named by ``apiKeyEnv`` (``None`` when the entry needs none)."""
+    """Return the key named by ``apiKeyEnv`` (``None`` when the entry needs none).
+
+    Refuses before the lookup when ``baseUrl`` is plain http to a non-loopback host,
+    so the key can't travel in cleartext even if config validation was bypassed.
+    """
     name = entry.get("apiKeyEnv")
     if not name:
         return None
-    source = os.environ if env is None else env
+    if cleartext_to_remote(str(entry.get("baseUrl") or "")):
+        raise ExecutionError("insecure_url", f"${name} is never sent over plain http to a non-loopback host")
+    source = SECRETS if env is None else env
     value = source.get(name)
     if not value:
         raise ExecutionError("missing_key", f"${name} is not set")

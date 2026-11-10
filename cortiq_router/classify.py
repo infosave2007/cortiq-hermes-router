@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Optional
+
+from .credentials import SECRETS, cleartext_to_remote
 
 logger = logging.getLogger(__name__)
 
@@ -109,14 +110,24 @@ def classify_detailed(text: str, config: dict, env: Optional[dict] = None,
                       opener: Optional[urllib.request.OpenerDirector] = None) -> tuple[Optional[dict], dict[str, Any]]:
     """Classify and return ``(decision, {status, classifier_latency_ms})``."""
     started = time.monotonic()
-    env = os.environ if env is None else env
-    key = env.get(config.get("apiKeyEnv", "CORTIQ_ROUTER_KEY"))
+    env = SECRETS if env is None else env
+    key_name = config.get("apiKeyEnv", "CORTIQ_ROUTER_KEY")
+    base = str(config.get("routerUrl", "https://router.allaigate.com")).rstrip("/")
+    if cleartext_to_remote(base):
+        log("cortiq-hermes-router: routerUrl is plain http to a non-loopback host — "
+            f"${key_name} is not sent, using fallback chain")
+        return None, _metadata("classifier_error", started, attempted=False)
+    try:
+        key = env.get(key_name)
+    except Exception as exc:  # e.g. Hermes refusing a read outside a profile scope
+        log(f"cortiq-hermes-router: ${key_name} lookup failed ({type(exc).__name__}) — "
+            "classification skipped, using fallback chain")
+        return None, _metadata("classifier_error", started, attempted=False)
     if not key:
-        log(f"cortiq-hermes-router: {config.get('apiKeyEnv', 'CORTIQ_ROUTER_KEY')} is not set — "
+        log(f"cortiq-hermes-router: {key_name} is not set — "
             "classification skipped, using fallback chain")
         return None, _metadata("classifier_error", started, attempted=False)
 
-    base = str(config.get("routerUrl", "https://router.allaigate.com")).rstrip("/")
     payload = json.dumps(build_route_body(
         text,
         profile=config.get("routerProfile", "balanced"),

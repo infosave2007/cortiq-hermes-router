@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import copy
 import json
-import os
 from typing import Any, Iterator, Mapping, Optional
+
+from .credentials import SECRETS
 
 
 # Only endpoint metadata and environment-variable NAMES live here.  Credentials
@@ -113,7 +114,7 @@ def iter_config_entries(config: dict[str, Any]) -> Iterator[tuple[str, Any]]:
 
 def config_warnings(config: dict[str, Any], env: Optional[Mapping[str, str]] = None) -> list[str]:
     """Return warnings without environment values, request data, or credentials."""
-    env = os.environ if env is None else env
+    env = SECRETS if env is None else env
     warnings: list[str] = []
     seen: dict[str, str] = {}
     for path, raw in iter_config_entries(config):

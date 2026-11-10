@@ -33,7 +33,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import shlex
 import threading
 import time
@@ -42,6 +41,7 @@ from typing import Any, Optional
 
 from .cortiq_router.classify import classify, classify_detailed
 from .cortiq_router.config import ConfigError, default_config_path, load_config
+from .cortiq_router.credentials import SECRETS, get_secret
 from .cortiq_router.execution import (
     ExecutionError, call_endpoint, native_text_response, probe_models, responses_to_chat_request, run_probe,
 )
@@ -507,7 +507,7 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
             f"  classifier     {config.get('routerUrl')} (taxonomy {config.get('taxonomyId')}), "
             f"profile {config.get('routerProfile')}, timeout {config.get('timeoutMs')}ms",
             f"  key            ${key_name}: "
-            f"{'set' if os.environ.get(key_name) else 'MISSING (fallback chain active)'}",
+            f"{'set' if get_secret(key_name) else 'MISSING (fallback chain active)'}",
             f"  tiers          {_summarize_tiers(config)}",
             f"  tool steps     {config.get('toolSteps', 'classify')} — "
             + ("each step classified on its tool output" if config.get('toolSteps', 'classify') == 'classify'
@@ -538,7 +538,7 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
 
     def _providers_text() -> str:
         config = _config()
-        env = os.environ
+        env = SECRETS
         direct = [entry for entry in unique_provider_entries(config) if entry["direct"]]
         managed = sum(1 for _path, value in iter_config_entries(config) if isinstance(value, str))
         if not direct:
@@ -581,7 +581,7 @@ def register(ctx) -> None:  # noqa: ANN001 - PluginContext, kept untyped for iso
             return (f"cortiq-hermes-router test: {scope} has only Hermes-managed string entries; "
                     "there is no direct endpoint to test.")
         entry = direct[0]
-        result = run_probe(entry, PROBE_PROMPT, env=os.environ)
+        result = run_probe(entry, PROBE_PROMPT, env=SECRETS)
         lines = [
             f"cortiq-hermes-router test — {scope}",
             f"  provider   {entry['provider']}",

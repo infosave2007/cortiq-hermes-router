@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
+from .credentials import LOOPBACK_HOSTS
 from .providers import API_MODES, ENTRY_FIELDS, is_provider_entry, normalize_entry
 
 PROFILES: tuple[str, ...] = ("balanced", "cost-saver", "quality-first")
@@ -32,7 +33,6 @@ TOOL_STEP_MODES: tuple[str, ...] = ("classify", "low")
 _REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
 
 RESERVED_EXTRA_BODY_KEYS: tuple[str, ...] = ("model", "messages", "stream")
-LOOPBACK_HOSTS: tuple[str, ...] = ("localhost", "127.0.0.1", "::1")
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Managed-model strings are forwarded verbatim to Hermes' active provider.
@@ -171,7 +171,7 @@ def _ensure_router_url(value: Any, field: str) -> str:
         raise
     if url.scheme not in ("http", "https") or url.username or url.password or url.query or url.fragment or not url.netloc:
         _invalid(field)
-    if url.scheme == "http" and url.hostname not in ("localhost", "127.0.0.1", "::1"):
+    if url.scheme == "http" and url.hostname not in LOOPBACK_HOSTS:
         _invalid(f"{field} (HTTP requires loopback)")
     return value.rstrip("/")
 
